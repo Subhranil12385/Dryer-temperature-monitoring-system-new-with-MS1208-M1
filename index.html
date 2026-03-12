@@ -2598,6 +2598,15 @@ input[type="date"]::-webkit-calendar-picker-indicator {
             .fb-title { font-size: 1em; }
             .fb-value { font-size: 1.8em; }
         }
+        /* Hysteresis section styles */
+        #tabThreshold .panel .panel-title[style*="color: #ffaa00"] {
+            border-bottom: 1px solid rgba(255, 170, 0, 0.3);
+        }
+
+        #hysteresisUpper:focus, #hysteresisLower:focus {
+            outline: none;
+            box-shadow: 0 0 10px currentColor;
+        }
     </style>
 </head>
 <body>
@@ -2673,27 +2682,63 @@ input[type="date"]::-webkit-calendar-picker-indicator {
             </div>
         </div>
 
-        <!-- ONLINE MONITORING SCREEN (FIXED) -->
-        <div id="onlineScreen">
-            <div class="nav-bar">
-                <button class="nav-btn active" id="navLiveMonitor" onclick="showLiveTab('monitor')">📊 LIVE</button>
-                <span class="nav-sep">|</span>
-                <button class="nav-btn" id="navLiveChart" onclick="showLiveTab('chart')">📈 CHARTS</button>
-                <span class="nav-sep">|</span>
-                <button class="nav-btn" id="navLiveThresh" onclick="showLiveTab('threshold')">⚙️ THRESHOLDS</button>
-                <span class="nav-sep">|</span>
-                <button class="nav-btn" id="navLiveAlerts" onclick="showLiveTab('alerts')">🚨 ALERTS HISTORY <span id="alertNavBadge" style="display:none;background:#ff4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:0.75em;margin-left:4px;">0</span></button>
-                <span class="nav-sep">|</span>
-                <button class="nav-btn" id="navLiveMcuAvail" onclick="showLiveTab('mcuAvail')">📡 MCU AVAILABILITY</button>
-                <span class="nav-sep">|</span>
-                <button class="nav-btn" id="navLiveDryerAvail" onclick="showLiveTab('dryerAvail')">🏭 DRYER AVAILABILITY</button>
-                <span class="nav-sep">|</span>
-                <button class="nav-btn" id="navLiveAi" onclick="showLiveTab('ai')"><span class="ai-nav-badge" style="background:linear-gradient(135deg,#7b61ff,#00ffcc);color:#000;border-radius:8px;padding:2px 10px;font-size:0.85em;font-weight:bold;letter-spacing:1px;">🤖𝔸𝕀 𝔸ℕ𝔸𝕃𝕐𝕊𝕋</span></button>
-                <span class="nav-sep">|</span>
-                <button class="nav-btn" id="navLiveEscalation" onclick="showLiveTab('escalation')" style="border-color:rgba(255,150,50,0.5);color:#ffaa33;">🔔 ESCALATION</button>
-                <span class="nav-sep">|</span>
-                <button class="nav-btn" id="navLiveReport" onclick="showLiveTab('report')" style="border-color:rgba(120,80,255,0.5);color:#bb99ff;">📄 REPORT</button>
-            </div>
+<!-- ONLINE MONITORING SCREEN  -->
+<div id="onlineScreen">
+    <div class="nav-bar">
+        <button class="nav-btn active" id="navLiveMonitor" onclick="showLiveTab('monitor')"
+    style="border-color:#ffffff;color:#ffffff;background:rgba(255,255,255,0.08);box-shadow:0 0 8px rgba(255,255,255,0.3),inset 0 0 8px rgba(255,255,255,0.05);">
+    📊 LIVE
+        </button>
+        <span class="nav-sep">|</span>
+
+        <button class="nav-btn" id="navLiveChart" onclick="showLiveTab('chart')"
+            style="border-color:#39ff14;color:#39ff14;background:rgba(57,255,20,0.08);box-shadow:0 0 8px rgba(57,255,20,0.3),inset 0 0 8px rgba(57,255,20,0.05);">
+            📈 CHARTS
+        </button>
+        <span class="nav-sep">|</span>
+
+        <button class="nav-btn" id="navLiveThresh" onclick="showLiveTab('threshold')"
+            style="border-color:#ff6ef7;color:#ff6ef7;background:rgba(255,110,247,0.08);box-shadow:0 0 8px rgba(255,110,247,0.3),inset 0 0 8px rgba(255,110,247,0.05);">
+            ⚙️ THRESHOLDS
+        </button>
+        <span class="nav-sep">|</span>
+
+        <button class="nav-btn" id="navLiveEscalation" onclick="showLiveTab('escalation')"
+             style="border-color:#cc7700;color:#cc7700;background:rgba(180,100,0,0.1);box-shadow:0 0 8px rgba(180,100,0,0.4),inset 0 0 8px rgba(180,100,0,0.07);">
+    🔔 ESCALATION
+        </button>
+        <span class="nav-sep">|</span>
+
+        <button class="nav-btn" id="navLiveAlerts" onclick="showLiveTab('alerts')"
+            style="border-color:#ff3c3c;color:#ff3c3c;background:rgba(255,60,60,0.08);box-shadow:0 0 8px rgba(255,60,60,0.3),inset 0 0 8px rgba(255,60,60,0.05);">
+            🚨 ALERTS HISTORY
+            <span id="alertNavBadge" style="display:none;background:#ff4444;color:#fff;border-radius:10px;padding:1px 6px;font-size:0.75em;margin-left:4px;">0</span>
+        </button>
+        <span class="nav-sep">|</span>
+
+        <button class="nav-btn" id="navLiveMcuAvail" onclick="showLiveTab('mcuAvail')"
+            style="border-color:#00e5ff;color:#00e5ff;background:rgba(0,229,255,0.08);box-shadow:0 0 8px rgba(0,229,255,0.3),inset 0 0 8px rgba(0,229,255,0.05);">
+            📡 MCU AVAILABILITY
+        </button>
+        <span class="nav-sep">|</span>
+
+        <button class="nav-btn" id="navLiveDryerAvail" onclick="showLiveTab('dryerAvail')"
+            style="border-color:#ffd700;color:#ffd700;background:rgba(255,215,0,0.08);box-shadow:0 0 8px rgba(255,215,0,0.3),inset 0 0 8px rgba(255,215,0,0.05);">
+            🏭 DRYER AVAILABILITY
+        </button>
+        <span class="nav-sep">|</span>
+
+        <button class="nav-btn" id="navLiveAi" onclick="showLiveTab('ai')"
+            style="border-color:#7b61ff;color:#fff;background:linear-gradient(135deg,rgba(123,97,255,0.15),rgba(0,255,204,0.1));box-shadow:0 0 12px rgba(123,97,255,0.45),inset 0 0 10px rgba(0,255,204,0.07);">
+            <span class="ai-nav-badge" style="background:linear-gradient(135deg,#7b61ff,#00ffcc);color:#000;border-radius:8px;padding:2px 10px;font-size:0.85em;font-weight:bold;letter-spacing:1px;">🤖𝔸𝕀 𝔸ℕ𝔸𝕃𝕐𝕊𝕋</span>
+        </button>
+        <span class="nav-sep">|</span>
+
+        <button class="nav-btn" id="navLiveReport" onclick="showLiveTab('report')"
+            style="border-color:#bb99ff;color:#bb99ff;background:rgba(187,153,255,0.08);box-shadow:0 0 8px rgba(187,153,255,0.3),inset 0 0 8px rgba(187,153,255,0.05);">
+            📄 REPORT
+        </button>
+    </div>
 
             <!-- MONITOR TAB -->
             <div id="tabMonitor">
@@ -2851,7 +2896,95 @@ input[type="date"]::-webkit-calendar-picker-indicator {
                         <button class="btn purple" onclick="setAllThresholds()">SET ALL TO A VALUE</button>
                     </div>
                 </div>
+
+		<!-- Hysteresis Settings -->
+<div class="panel" style="margin-top: 20px; border-color: rgba(255, 170, 0, 0.4);">
+    <div class="panel-title" style="color: #ffaa00;">📊 HYSTERESIS SETTINGS</div>
+    <div style="font-size:0.8em; color:rgba(255,170,0,0.7); margin-bottom:15px;">
+        Alerts trigger at: Upper Threshold + Upper Hysteresis | Lower Threshold + Lower Hysteresis
+    </div>
+    
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px;">
+        <!-- Upper Hysteresis -->
+        <div style="background: rgba(0,30,60,0.7); border: 1px solid #ffaa00; border-radius: 8px; padding: 15px;">
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 15px;">
+                <span style="font-size: 1.5em; color: #ffaa00;">▲</span>
+                <span style="font-family: 'Rajdhani', sans-serif; font-size: 1.1em; color: #ffaa00;">UPPER HYSTERESIS</span>
+            </div>
+            <div style="margin-bottom: 10px;">
+                <div style="font-size:0.7em; color:rgba(255,170,0,0.6); margin-bottom:5px;">Value (°C) - Added to upper threshold</div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <input type="number" id="hysteresisUpper" 
+                        value="0" min="-50" max="50" step="0.5"
+                        style="flex:1; background:rgba(0,40,80,0.9); color:#ffaa00; border:1px solid #ffaa00; 
+                               border-radius:6px; padding:10px 15px; font-family:'Share Tech Mono',monospace; 
+                               font-size:1.1em; font-weight:bold;">
+                    <span style="color:#ffaa00; font-size:0.9em;">°C</span>
                 </div>
+            </div>
+            <div style="font-size:0.75em; color:rgba(255,170,0,0.4); background:rgba(0,20,40,0.5); padding:8px; border-radius:4px;">
+                Example: Upper threshold 120°C + Hysteresis 5°C → Email alert triggers at 125°C
+            </div>
+        </div>
+
+        <!-- Lower Hysteresis -->
+        <div style="background: rgba(0,30,60,0.7); border: 1px solid #40c0ff; border-radius: 8px; padding: 15px;">
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 15px;">
+                <span style="font-size: 1.5em; color: #40c0ff;">▼</span>
+                <span style="font-family: 'Rajdhani', sans-serif; font-size: 1.1em; color: #40c0ff;">LOWER HYSTERESIS</span>
+            </div>
+            <div style="margin-bottom: 10px;">
+                <div style="font-size:0.7em; color:rgba(64,192,255,0.6); margin-bottom:5px;">Value (°C) - Added to lower threshold</div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <input type="number" id="hysteresisLower" 
+                        value="0" min="-50" max="50" step="0.5"
+                        style="flex:1; background:rgba(0,40,80,0.9); color:#40c0ff; border:1px solid #40c0ff; 
+                               border-radius:6px; padding:10px 15px; font-family:'Share Tech Mono',monospace; 
+                               font-size:1.1em; font-weight:bold;">
+                    <span style="color:#40c0ff; font-size:0.9em;">°C</span>
+                </div>
+            </div>
+            <div style="font-size:0.75em; color:rgba(64,192,255,0.4); background:rgba(0,20,40,0.5); padding:8px; border-radius:4px;">
+                Example: Lower threshold 90°C + Hysteresis -5°C → Email alert triggers at 85°C
+            </div>
+        </div>
+    </div>
+
+    <div style="display: flex; gap: 15px; margin-top: 20px; justify-content: flex-end;">
+        <button class="btn" onclick="fetchHysteresisValues()" 
+                style="border-color: #ffaa00; color: #ffaa00;">
+            ⟳ LOAD FROM SHEET
+        </button>
+        <button class="btn primary" onclick="saveHysteresisValues()" 
+                style="background: rgba(255,170,0,0.2); border-color: #ffaa00; color: #ffaa00;">
+            💾 SAVE HYSTERESIS
+        </button>
+    </div>
+</div>
+
+                </div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
             </div>
 
             <!-- ALERTS TAB -->
@@ -3765,7 +3898,7 @@ Responses generated by AI may not always be accurate; please do not rely on them
         let toastTimer;
 
         // ===== ONLINE MODE VARIABLES =====
-        let sheetUrl = 'https://script.google.com/macros/s/AKfycbzTHmmYYxCN-ozx7nEp1HXh-HMOO0F2Msxpi8FEhl4d7BLRErpYJUzvFlre_8DC4arZ/exec';
+        let sheetUrl = 'https://script.google.com/macros/s/AKfycbxuLA63VRxLhIyPbaCuw87VmSgDmElCUprgbbOJl6B5NEdNWLdUnkSDhG4CwSFLptmG/exec';
         let isConnected = false;
         let liveTimer = null;
         let liveRange  = '24h';
@@ -4261,6 +4394,7 @@ function addGapThresholdSlider() {
         } else {
             document.getElementById('threshPwGate').style.display = 'none';
             document.getElementById('threshPanel').style.display = 'block';
+		fetchHysteresisValues(); // Load hysteresis when threshold tab opens
         }
     }
     if (tab === 'mcuAvail' && !_availAutoFetched.mcu) {
@@ -8653,10 +8787,10 @@ function displayQuote(text, author, icon) {
         // ===== AI ANALYST — GROQ + FLIPBOOK =====
 
         const GROQ_API_KEYS = [
-            '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',
-            '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',
-            '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',
-            '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'
+            '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',
+            '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',
+            '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',
+            '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'
         ];
         let groqKeyIndex = 0;
         function getGroqKey() { return GROQ_API_KEYS[groqKeyIndex % GROQ_API_KEYS.length]; }
@@ -11145,6 +11279,110 @@ ${buildAiDataContext()}`;
                 setTimeout(() => { scanline.style.opacity = '0'; }, 3000);
             }
         });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ===== HYSTERESIS FUNCTIONS =====
+
+// Fetch current hysteresis values from sheet
+async function fetchHysteresisValues() {
+    if (!sheetUrl) {
+        showToast('Not connected to Google Sheets', 'error');
+        return;
+    }
+    
+    showLoading(true, 'FETCHING HYSTERESIS VALUES...');
+    try {
+        const resp = await fetchWithRetry(sheetUrl + '?action=getHysteresis');
+        const data = await resp.json();
+        
+        if (data.error) {
+            showToast('Error: ' + data.error, 'error');
+        } else {
+            document.getElementById('hysteresisUpper').value = data.upper || 0;
+            document.getElementById('hysteresisLower').value = data.lower || 0;
+            showToast('Hysteresis values loaded', 'success');
+        }
+    } catch (e) {
+        showToast('Fetch error: ' + e.message, 'error');
+    } finally {
+        showLoading(false);
+    }
+}
+
+// Save hysteresis values to sheet
+async function saveHysteresisValues() {
+    if (!sheetUrl) {
+        showToast('Not connected to Google Sheets', 'error');
+        return;
+    }
+    
+    const upper = parseFloat(document.getElementById('hysteresisUpper').value);
+    const lower = parseFloat(document.getElementById('hysteresisLower').value);
+    
+    if (isNaN(upper) || isNaN(lower)) {
+        showToast('Please enter valid numbers', 'error');
+        return;
+    }
+    
+    showLoading(true, 'SAVING HYSTERESIS...');
+    try {
+        const url = sheetUrl + '?action=saveHysteresis&upper=' + upper + '&lower=' + lower;
+        const resp = await fetchWithRetry(url);
+        const data = await resp.json();
+        
+        if (data.ok || data.success) {
+            showToast('✓ Hysteresis saved successfully', 'success');
+            
+            // Mark the inputs as saved (visual feedback)
+            const upperInput = document.getElementById('hysteresisUpper');
+            const lowerInput = document.getElementById('hysteresisLower');
+            
+            upperInput.style.borderColor = '#00ff88';
+            lowerInput.style.borderColor = '#00ff88';
+            
+            setTimeout(() => {
+                upperInput.style.borderColor = '#ffaa00';
+                lowerInput.style.borderColor = '#40c0ff';
+            }, 2000);
+        } else {
+            showToast('Save failed: ' + (data.error || 'unknown'), 'error');
+        }
+    } catch (e) {
+        showToast('Save error: ' + e.message, 'error');
+    } finally {
+        showLoading(false);
+    }
+}
+
+// Add this to your existing syncThresholdInputs function or call it when threshold tab opens
+function loadHysteresisOnTabOpen() {
+    if (document.getElementById('tabThreshold').style.display === 'block' && _threshUnlocked) {
+        fetchHysteresisValues();
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
     </script>
 </body>
 </html>
