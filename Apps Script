@@ -1,15 +1,10 @@
-// ============================================================
-//   CPIL CHENNAI — DRYER TEMPERATURE MONITORING — Apps Script
-//   UPDATED: Added Remarks (col K) to Alert History sheet
-// ============================================================
-
 var NUM_DRYERS                = 4;
 var NUM_CHAMBERS              = 8;
 var TOTAL_CHANNELS            = NUM_DRYERS * NUM_CHAMBERS; // 32
 var ALERT_COOLDOWN_MS         = 5 * 60 * 1000;
 var MERGE_WINDOW_SECONDS      = 30;
 var LOOKBACK_MINUTES          = 5;
-var MCU_OFF_THRESHOLD_SECONDS = 90;
+var MCU_OFF_THRESHOLD_SECONDS = 120;;
 var DEFAULT_UPPER_THRESHOLD   = 200;
 var DEFAULT_LOWER_THRESHOLD   = 10;
 var DEFAULT_STATUS_TIMEOUT    = 120;
@@ -18,6 +13,29 @@ var MIN_DRYER_OFF_SECONDS     = 120;
 
 // ==================== TELEGRAM CONFIG ====================
 var TELEGRAM_BOT_TOKEN = "8663310055:AAGgp5jzYljvDMrd0QBJ2k8UUUzzEL6GXvU";
+
+function getTwilioConfig() {
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("APIs");
+    if (!sheet) return null;
+    var data = sheet.getRange("B2:B5").getValues();
+    var fromNum = "14155238886"; 
+    var toNum   = (data[3][0] || "").toString().trim();
+    if (fromNum && !fromNum.startsWith("+")) fromNum = "+" + fromNum;
+    if (toNum   && !toNum.startsWith("+"))   toNum   = "+" + toNum;
+    var config = {
+      sid: (data[0][0] || "").toString().trim(),
+      token: (data[1][0] || "").toString().trim(),
+      from: fromNum,
+      to: toNum
+    };
+    if (config.sid && config.token && config.from && config.to) return config;
+    return null;
+  } catch (e) {
+    Logger.log("getTwilioConfig error: " + e.toString());
+    return null;
+  }
+}
 
 function getTelegramChatIds() {
   try {
@@ -47,6 +65,29 @@ function sendTelegramMessage(chatIds, text) {
       Logger.log("Telegram error for chat_id " + chatId + ": " + err.toString());
     }
   });
+}
+
+function sendWhatsappMessage(text) {
+  var config = getTwilioConfig();
+  if (!config) {
+    Logger.log("Twilio config not found or incomplete. Skipping WhatsApp message.");
+    return;
+  }
+  var url = "https://api.twilio.com/2010-04-01/Accounts/" + config.sid + "/Messages.json";
+  var payload = { "To": "whatsapp:" + config.to, "From": "whatsapp:" + config.from, "Body": text };
+  var options = {
+    "method": "post", "payload": payload,
+    "headers": { "Authorization": "Basic " + Utilities.base64Encode(config.sid + ":" + config.token) },
+    "muteHttpExceptions": true
+  };
+  try {
+    var response = UrlFetchApp.fetch(url, options);
+    var result = JSON.parse(response.getContentText());
+    if (result.error_message) Logger.log("Twilio send failed: " + result.error_message);
+    else Logger.log("Twilio message sent successfully to: " + config.to);
+  } catch (err) {
+    Logger.log("Twilio error: " + err.toString());
+  }
 }
 
 function buildTelegramEscalationMessage(alerts, intervalMin) {
@@ -83,6 +124,166 @@ function buildTelegramResolutionMessage(alert, currentTemp, durSec) {
   return lines.join("\n");
 }
 
+function buildWhatsappAlertMessage(alerts, intervalMin) {
+  var lines = [];
+  lines.push("🚨 *Dryer Temperature Alert* 🚨");
+  lines.push("This alert may repeat every " + intervalMin + " min until resolved.\n");
+  alerts.forEach(function(a) {
+    var typeStr = a.alertType === "LOW" ? "⬇️ BELOW LOWER" : "⬆️ ABOVE UPPER";
+    lines.push("*Dryer " + a.dryer + " – Chamber " + a.chamber + "* [" + typeStr + " THRESHOLD]");
+    lines.push("  Peak: " + a.peak.toFixed(2) + "°C  |  Threshold: " + a.threshold + "°C");
+    lines.push("  Started: " + a.startTime);
+    lines.push("");
+  });
+  lines.push("— CPIL Chennai Dryer Temperature Monitoring System");
+  return lines.join("\n");
+}
+
+function buildWhatsappResolutionMessage(alert, currentTemp, durSec) {
+  var lines = [];
+  lines.push("✅ *Alert RESOLVED* ✅\n");
+  var typeStr   = alert.alertType === "LOW" ? "⬇️ Below Lower" : "⬆️ Above Upper";
+  var diffLabel = alert.alertType === "LOW"  ? "above lower threshold" : "below upper threshold";
+  var diff      = Math.abs(currentTemp - alert.threshold).toFixed(2);
+  lines.push("*Dryer " + alert.dryer + " – Chamber " + alert.chamber + "*");
+  lines.push("  Type: " + typeStr + " Threshold");
+  lines.push("  Alert started: " + alert.startTime);
+  lines.push("  Resolved at:   " + alert.resolvedTime);
+  lines.push("  Duration:      " + formatDurationGas(durSec || 0));
+  lines.push("  Peak temp:     " + alert.peak.toFixed(2) + "°C");
+  lines.push("  Threshold:     " + alert.threshold + "°C");
+  lines.push("  Current temp:  " + currentTemp.toFixed(2) + "°C  (" + diff + "°C " + diffLabel + ")");
+  lines.push("");
+  lines.push("— CPIL Chennai - Dryer Temperature Monitoring System");
+  return lines.join("\n");
+}
+
+// =========================================================
+// HYSTERESIS HELPERS
+// B6 = upper hysteresis (added to upper threshold for alert trigger)
+// B7 = lower hysteresis (added to lower threshold for alert trigger — typically negative)
+// =========================================================
+function readHysteresis(threshSheet) {
+  try {
+    var upperVal = threshSheet.getRange("B6").getValue();
+    var lowerVal = threshSheet.getRange("B7").getValue();
+    var upper = parseFloat(upperVal);
+    var lower = parseFloat(lowerVal);
+    return {
+      upper: isNaN(upper) ? 0 : upper,
+      lower: isNaN(lower) ? 0 : lower
+    };
+  } catch(e) {
+    Logger.log("readHysteresis error: " + e.toString());
+    return { upper: 0, lower: 0 };
+  }
+}
+
+function ensureHysteresisLabels(threshSheet) {
+  // Ensure B5 has a label and B6/B7 have values if empty
+  try {
+    var b5 = threshSheet.getRange("A6").getValue();
+    if (!b5 || b5.toString().trim() === "") {
+      threshSheet.getRange("A6").setValue("Upper Hysteresis (°C)");
+      threshSheet.getRange("A6").setFontWeight("bold");
+    }
+    var b7label = threshSheet.getRange("A7").getValue();
+    if (!b7label || b7label.toString().trim() === "") {
+      threshSheet.getRange("A7").setValue("Lower Hysteresis (°C)");
+      threshSheet.getRange("A7").setFontWeight("bold");
+    }
+    var b6 = threshSheet.getRange("B6").getValue();
+    if (b6 === "" || b6 === null || b6 === undefined) threshSheet.getRange("B6").setValue(0);
+    var b7 = threshSheet.getRange("B7").getValue();
+    if (b7 === "" || b7 === null || b7 === undefined) threshSheet.getRange("B7").setValue(0);
+  } catch(e) {
+    Logger.log("ensureHysteresisLabels error: " + e.toString());
+  }
+}
+
+// =========================================================
+// MCU OFFLINE EMAIL TRACKING
+// We use Script Cache to track MCU online/offline state
+// and send exactly one email per transition.
+// =========================================================
+function getMcuOfflineState() {
+  try {
+    var cache = CacheService.getScriptCache();
+    var val = cache.get("mcu_offline_state");
+    // val: null = unknown/online, "offline:<timestamp_ms>:<formatted_ts>" = offline
+    return val || null;
+  } catch(e) { return null; }
+}
+
+function setMcuOfflineState(val) {
+  try {
+    var cache = CacheService.getScriptCache();
+    if (val === null) cache.remove("mcu_offline_state");
+    else cache.put("mcu_offline_state", val, 86400);
+  } catch(e) {}
+}
+
+function isMcuCurrentlyOnline(statusSheet) {
+  try {
+    var timeout = getStatusTimeout(statusSheet);
+    var numRows = statusSheet.getLastRow();
+    if (numRows < 2) return false;
+    var now = new Date();
+    var data = statusSheet.getRange(2, 1, numRows - 1, 3).getValues();
+    for (var i = 0; i < data.length; i++) {
+      var lastTs = parseSheetTimestamp(data[i][2].toString());
+      if (lastTs && (now - lastTs) / 1000 <= timeout) return true;
+    }
+    return false;
+  } catch(e) {
+    Logger.log("isMcuCurrentlyOnline error: " + e.toString());
+    return false;
+  }
+}
+
+function sendMcuOfflineEmail(recipients, telegramIds, offlineTs) {
+  var tz  = Session.getScriptTimeZone();
+  var tsStr = Utilities.formatDate(offlineTs, tz, "dd/MM/yyyy HH:mm:ss");
+  var subject = "🔴 Dryer Temperature Monitor – MCU OFFLINE at " + tsStr;
+  var body = "Dryer Temperature Monitor – MCU OFFLINE\n" +
+    "============================================================\n\n" +
+    "The Microcontroller (MCU) went offline at: " + tsStr + "\n\n" +
+    "No temperature data is being received. All dryer states are unknown.\n" +
+    "No further alert emails will be sent while the MCU is offline.\n\n" +
+    "--\nCPIL Chennai - Dryer Temperature Monitoring System (Auto-alert)";
+  try {
+    if (recipients && recipients.length > 0) GmailApp.sendEmail(recipients.join(","), subject, body);
+  } catch(e) {
+    try { if (recipients && recipients.length > 0) MailApp.sendEmail({ to: recipients.join(","), subject: subject, body: body }); } catch(e2) {}
+  }
+  if (telegramIds && telegramIds.length > 0) {
+    sendTelegramMessage(telegramIds, "🔴 <b>MCU OFFLINE</b>\n\nDryer Temperature Monitor MCU went offline at <b>" + tsStr + "</b>.\n\nNo further alerts until MCU is back online.\n\n— CPIL Chennai");
+  }
+  try { sendWhatsappMessage("🔴 *MCU OFFLINE*\n\nDryer Temperature Monitor MCU went offline at " + tsStr + ".\n\nNo further alerts until MCU is back online.\n\n— CPIL Chennai"); } catch(e) {}
+}
+
+function sendMcuOnlineEmail(recipients, telegramIds, offlineMs, onlineTs) {
+  var tz  = Session.getScriptTimeZone();
+  var tsStr = Utilities.formatDate(onlineTs, tz, "dd/MM/yyyy HH:mm:ss");
+  var durSec = Math.round((onlineTs.getTime() - offlineMs) / 1000);
+  var subject = "🟢 Dryer Temperature Monitor – MCU BACK ONLINE at " + tsStr;
+  var body = "Dryer Temperature Monitor – MCU BACK ONLINE\n" +
+    "============================================================\n\n" +
+    "The Microcontroller (MCU) is back online at: " + tsStr + "\n" +
+    "Offline duration: " + formatDurationGas(durSec) + "\n\n" +
+    "Temperature monitoring has resumed normally.\n\n" +
+    "--\nCPIL Chennai - Dryer Temperature Monitoring System (Auto-alert)";
+  try {
+    if (recipients && recipients.length > 0) GmailApp.sendEmail(recipients.join(","), subject, body);
+  } catch(e) {
+    try { if (recipients && recipients.length > 0) MailApp.sendEmail({ to: recipients.join(","), subject: subject, body: body }); } catch(e2) {}
+  }
+  if (telegramIds && telegramIds.length > 0) {
+    sendTelegramMessage(telegramIds, "🟢 <b>MCU BACK ONLINE</b>\n\nDryer Temperature Monitor MCU is back online at <b>" + tsStr + "</b>.\nOffline duration: " + formatDurationGas(durSec) + "\n\n— CPIL Chennai");
+  }
+  try { sendWhatsappMessage("🟢 *MCU BACK ONLINE*\n\nDryer Temperature Monitor MCU is back online at " + tsStr + ".\nOffline duration: " + formatDurationGas(durSec) + "\n\n— CPIL Chennai"); } catch(e) {}
+}
+
 // =========================================================
 // doGet Router
 // =========================================================
@@ -115,14 +316,17 @@ function doGet(e) {
     if (action === "getAvailability")            return handleGetAvailability(e, ss, dataSheet);
     if (action === "generateAvailabilitySheets") return handleGenerateAvailabilitySheets(ss, dataSheet);
     if (action === "aiChat")                     return handleAiChat(e, ss, dataSheet, threshSheet, statusSheet);
+    if (action === "getApiKeys")                 return handleGetApiKeys(ss);
     if (action === "escalGetContacts")           return handleEscalGetContacts(emailSheet);
     if (action === "escalSaveRow")               return handleEscalSaveRow(e, emailSheet);
     if (action === "escalAddRow")                return handleEscalAddRow(e, emailSheet);
     if (action === "escalDeleteRow")             return handleEscalDeleteRow(e, emailSheet);
     if (action === "escalSaveIntervals")         return handleEscalSaveIntervals(e, emailSheet);
-
-    // ── NEW: save a remark to column K of Alert History ──
     if (action === "saveAlertRemark")            return handleSaveAlertRemark(e, alertSheet);
+
+    // ── NEW: Hysteresis get/save ──
+    if (action === "getHysteresis")              return handleGetHysteresis(threshSheet);
+    if (action === "saveHysteresis")             return handleSaveHysteresis(e, threshSheet);
 
     return handleRead(e, ss, dataSheet, statusSheet, threshSheet);
   } catch (err) {
@@ -132,9 +336,33 @@ function doGet(e) {
 }
 
 // =========================================================
-// NEW: handleSaveAlertRemark
-//   Finds the matching alert row by dryer + chamber + startTime
-//   and writes the remark text to column K (index 11).
+// NEW: handleGetHysteresis — returns B6 (upper) and B7 (lower)
+// =========================================================
+function handleGetHysteresis(threshSheet) {
+  ensureThresholdHeaders(threshSheet);
+  ensureHysteresisLabels(threshSheet);
+  var hys = readHysteresis(threshSheet);
+  return jsonResponse({ upper: hys.upper, lower: hys.lower });
+}
+
+// =========================================================
+// NEW: handleSaveHysteresis — writes upper to B6, lower to B7
+// =========================================================
+function handleSaveHysteresis(e, threshSheet) {
+  ensureThresholdHeaders(threshSheet);
+  ensureHysteresisLabels(threshSheet);
+  var upper = parseFloat(e.parameter.upper);
+  var lower = parseFloat(e.parameter.lower);
+  if (isNaN(upper)) return jsonResponse({ error: "Invalid upper hysteresis value" });
+  if (isNaN(lower)) return jsonResponse({ error: "Invalid lower hysteresis value" });
+  threshSheet.getRange("B6").setValue(upper);
+  threshSheet.getRange("B7").setValue(lower);
+  Logger.log("Hysteresis saved — upper: " + upper + ", lower: " + lower);
+  return jsonResponse({ ok: true, upper: upper, lower: lower });
+}
+
+// =========================================================
+// handleSaveAlertRemark
 // =========================================================
 function handleSaveAlertRemark(e, alertSheet) {
   var dryer     = parseInt(e.parameter.dryer);
@@ -155,7 +383,6 @@ function handleSaveAlertRemark(e, alertSheet) {
     if (parseInt(data[i][0]) === dryer &&
         parseInt(data[i][1]) === chamber &&
         data[i][2].toString().trim() === startTime) {
-      // Write to col K (column index 11 = 1-based col 11)
       alertSheet.getRange(i + 2, 11).setValue(remark);
       Logger.log("saveAlertRemark: updated row " + (i + 2) + " with remark: " + remark);
       return jsonResponse({ ok: true, row: i + 2 });
@@ -165,7 +392,7 @@ function handleSaveAlertRemark(e, alertSheet) {
 }
 
 // =========================================================
-// handleGetAlertHistory — now returns remarks (col K)
+// handleGetAlertHistory — returns remarks (col K)
 // =========================================================
 function handleGetAlertHistory(e, alertSheet, threshSheet) {
   ensureAlertHistoryHeaders(alertSheet);
@@ -186,7 +413,6 @@ function handleGetAlertHistory(e, alertSheet, threshSheet) {
   var numRows = alertSheet.getLastRow();
   if (numRows < 2) return jsonResponse({ alerts: [] });
 
-  // Read 11 columns (A–K) to include Remarks
   var data   = alertSheet.getRange(2, 1, numRows - 1, 11).getValues();
   var alerts = [];
 
@@ -209,7 +435,7 @@ function handleGetAlertHistory(e, alertSheet, threshSheet) {
       durationSeconds: parseInt(row[7])   || 0,
       status:          row[8].toString(),
       alertType:       row[9] ? row[9].toString() : "HIGH",
-      remarks:         row[10] ? row[10].toString() : ""   // ← col K
+      remarks:         row[10] ? row[10].toString() : ""
     });
   });
 
@@ -221,11 +447,10 @@ function handleGetAlertHistory(e, alertSheet, threshSheet) {
 }
 
 // =========================================================
-// ensureAlertHistoryHeaders — now ensures 11 columns (A–K)
+// ensureAlertHistoryHeaders — 11 columns (A–K)
 // =========================================================
 function ensureAlertHistoryHeaders(sheet) {
   if (sheet.getLastRow() > 0) {
-    // Ensure column K header exists even in old sheets
     var kHeader = sheet.getRange(1, 11).getValue();
     if (!kHeader || kHeader.toString().trim() === "") {
       sheet.getRange(1, 11).setValue("Remarks");
@@ -244,9 +469,8 @@ function ensureAlertHistoryHeaders(sheet) {
 }
 
 // =========================================================
-// All other functions remain the same — copied from original
+// Escalation contacts & intervals
 // =========================================================
-
 function handleEscalGetContacts(emailSheet) {
   ensureEmailHeaders(emailSheet);
   var lastRow  = emailSheet.getLastRow();
@@ -468,10 +692,12 @@ function handleGetThresholds(threshSheet) {
   ensureThresholdHeaders(threshSheet);
   return jsonResponse({ thresholds: readThresholds(threshSheet), lowerThresholds: readLowerThresholds(threshSheet) });
 }
+
 function handleGetLowerThresholdsAction(threshSheet) {
   ensureThresholdHeaders(threshSheet);
   return jsonResponse({ lowerThresholds: readLowerThresholds(threshSheet) });
 }
+
 function handleGetStatus(statusSheet) {
   return jsonResponse({ statusInfo: buildStatusResponse(statusSheet) });
 }
@@ -626,13 +852,20 @@ function handleGenerateAlerts(ss, dataSheet, threshSheet, alertSheet) {
     alertSheet.clearContents(); ensureAlertHistoryHeaders(alertSheet);
     ensureThresholdHeaders(threshSheet);
     var thresholds=readThresholds(threshSheet),lowerThresholds=readLowerThresholds(threshSheet);
+    // Read hysteresis for batch generation too
+    var hys = readHysteresis(threshSheet);
     var lastRow=dataSheet.getLastRow();if(lastRow<2)return jsonResponse({message:"No data to process",alertsCreated:0});
     var data=dataSheet.getRange(2,1,lastRow-1,TOTAL_CHANNELS+1).getValues(),active={},alertRows=[],tz=Session.getScriptTimeZone();
     for(var i=0;i<data.length;i++){var row=data[i],rowTime=null;if(row[0])rowTime=(row[0]instanceof Date)?row[0]:parseSheetTimestamp(row[0].toString());if(!rowTime)continue;var timestamp=Utilities.formatDate(rowTime,tz,"dd/MM/yyyy HH:mm:ss"),isLastRow=(i===data.length-1);
-      for(var d=1;d<=NUM_DRYERS;d++){for(var c=1;c<=NUM_CHAMBERS;c++){var colIndex=(d-1)*NUM_CHAMBERS+c,temp=parseFloat(row[colIndex]),keyH="D"+d+"C"+c+"_H",keyL="D"+d+"C"+c+"_L",upThresh=thresholds["D"+d]?thresholds["D"+d]["C"+c]:DEFAULT_UPPER_THRESHOLD,loThresh=lowerThresholds["D"+d]?lowerThresholds["D"+d]["C"+c]:DEFAULT_LOWER_THRESHOLD;
+      for(var d=1;d<=NUM_DRYERS;d++){for(var c=1;c<=NUM_CHAMBERS;c++){var colIndex=(d-1)*NUM_CHAMBERS+c,temp=parseFloat(row[colIndex]),keyH="D"+d+"C"+c+"_H",keyL="D"+d+"C"+c+"_L";
+        var upThresh=(thresholds["D"+d]?thresholds["D"+d]["C"+c]:DEFAULT_UPPER_THRESHOLD);
+        var loThresh=(lowerThresholds["D"+d]?lowerThresholds["D"+d]["C"+c]:DEFAULT_LOWER_THRESHOLD);
+        // Apply hysteresis
+        var effectiveUpperTrigger = upThresh + hys.upper;
+        var effectiveLowerTrigger = loThresh + hys.lower;
         if(isNaN(temp)||temp===0){closeActiveAlert(active,alertRows,keyH,timestamp,rowTime);closeActiveAlert(active,alertRows,keyL,timestamp,rowTime);continue;}
-        if(!isNaN(upThresh)&&temp>upThresh){var overBy=parseFloat((temp-upThresh).toFixed(2));if(!active[keyH])active[keyH]={dryer:d,chamber:c,startTime:timestamp,startTs:rowTime,peak:temp,thresh:upThresh,overBy,type:"HIGH"};else if(temp>active[keyH].peak){active[keyH].peak=temp;active[keyH].overBy=overBy;}if(isLastRow){var a=active[keyH];alertRows.push([a.dryer,a.chamber,a.startTime,"Not Resolved",a.peak,a.thresh,a.overBy,Math.round((rowTime-a.startTs)/1000),"ACTIVE","HIGH",""]);delete active[keyH];}}else closeActiveAlert(active,alertRows,keyH,timestamp,rowTime);
-        if(!isNaN(loThresh)&&loThresh>0&&temp<loThresh){var underBy=parseFloat((loThresh-temp).toFixed(2));if(!active[keyL])active[keyL]={dryer:d,chamber:c,startTime:timestamp,startTs:rowTime,peak:temp,thresh:loThresh,overBy:-underBy,type:"LOW"};else if(temp<active[keyL].peak){active[keyL].peak=temp;active[keyL].overBy=-underBy;}if(isLastRow){var al=active[keyL];alertRows.push([al.dryer,al.chamber,al.startTime,"Not Resolved",al.peak,al.thresh,al.overBy,Math.round((rowTime-al.startTs)/1000),"ACTIVE","LOW",""]);delete active[keyL];}}else closeActiveAlert(active,alertRows,keyL,timestamp,rowTime);
+        if(!isNaN(upThresh)&&temp>effectiveUpperTrigger){var overBy=parseFloat((temp-upThresh).toFixed(2));if(!active[keyH])active[keyH]={dryer:d,chamber:c,startTime:timestamp,startTs:rowTime,peak:temp,thresh:upThresh,overBy,type:"HIGH"};else if(temp>active[keyH].peak){active[keyH].peak=temp;active[keyH].overBy=overBy;}if(isLastRow){var a=active[keyH];alertRows.push([a.dryer,a.chamber,a.startTime,"Not Resolved",a.peak,a.thresh,a.overBy,Math.round((rowTime-a.startTs)/1000),"ACTIVE","HIGH",""]);delete active[keyH];}}else closeActiveAlert(active,alertRows,keyH,timestamp,rowTime);
+        if(!isNaN(loThresh)&&loThresh>0&&temp<effectiveLowerTrigger){var underBy=parseFloat((loThresh-temp).toFixed(2));if(!active[keyL])active[keyL]={dryer:d,chamber:c,startTime:timestamp,startTs:rowTime,peak:temp,thresh:loThresh,overBy:-underBy,type:"LOW"};else if(temp<active[keyL].peak){active[keyL].peak=temp;active[keyL].overBy=-underBy;}if(isLastRow){var al=active[keyL];alertRows.push([al.dryer,al.chamber,al.startTime,"Not Resolved",al.peak,al.thresh,al.overBy,Math.round((rowTime-al.startTs)/1000),"ACTIVE","LOW",""]);delete active[keyL];}}else closeActiveAlert(active,alertRows,keyL,timestamp,rowTime);
       }}
     }
     for(var remainKey in active){var ra=active[remainKey];alertRows.push([ra.dryer,ra.chamber,ra.startTime,"Not Resolved",ra.peak,ra.thresh,ra.overBy,0,"ACTIVE",ra.type,""]);}
@@ -643,36 +876,166 @@ function handleGenerateAlerts(ss, dataSheet, threshSheet, alertSheet) {
 
 function closeActiveAlert(active,alertRows,key,timestamp,rowTime){if(active[key]){var a=active[key],dur=Math.max(0,Math.round((rowTime-a.startTs)/1000));alertRows.push([a.dryer,a.chamber,a.startTime,timestamp,a.peak,a.thresh,a.overBy,dur,"RESOLVED",a.type,""]);delete active[key];}}
 
+// =========================================================
+// autoCheckAlerts — MAIN ALERT TRIGGER (every 1 min)
+// FIX 1: Hysteresis applied before alert trigger
+// FIX 2: If MCU offline → suppress escalation, send one offline email
+//         When MCU comes back → send one back-online email
+// =========================================================
 function autoCheckAlerts(){
   try{
-    var ss=SpreadsheetApp.getActiveSpreadsheet(),dataSheet=getOrCreateSheet(ss,"Sheet1"),threshSheet=getOrCreateSheet(ss,"Thresholds Sheet"),alertSheet=getOrCreateSheet(ss,"Alert History"),emailSheet=getOrCreateSheet(ss,"Email IDs");
+    var ss=SpreadsheetApp.getActiveSpreadsheet(),
+        dataSheet=getOrCreateSheet(ss,"Sheet1"),
+        threshSheet=getOrCreateSheet(ss,"Thresholds Sheet"),
+        alertSheet=getOrCreateSheet(ss,"Alert History"),
+        emailSheet=getOrCreateSheet(ss,"Email IDs"),
+        statusSheet=getOrCreateSheet(ss,"Status Sheet");
     ensureAlertHistoryHeaders(alertSheet);ensureThresholdHeaders(threshSheet);
-    var thresholds=readThresholds(threshSheet),lowerThresholds=readLowerThresholds(threshSheet),now=new Date(),lookbackTime=new Date(now.getTime()-LOOKBACK_MINUTES*60*1000),tz=Session.getScriptTimeZone(),lastRow=dataSheet.getLastRow();if(lastRow<2)return;
-    var rowsToCheck=Math.min(20,lastRow-1),startRow=lastRow-rowsToCheck+1,data=dataSheet.getRange(startRow,1,rowsToCheck,TOTAL_CHANNELS+1).getValues();
-    var previouslyActiveKeys={},prevActiveAlerts=getActiveAlerts(alertSheet);prevActiveAlerts.forEach(function(a){previouslyActiveKeys["D"+a.dryer+"C"+a.chamber+"_"+a.alertType]=a;});
-    var latestState={};
-    for(var i=0;i<data.length;i++){var row=data[i],rowTime=null;if(row[0])rowTime=(row[0]instanceof Date)?row[0]:parseSheetTimestamp(row[0].toString());if(!rowTime||rowTime<lookbackTime)continue;
-      for(var d=1;d<=NUM_DRYERS;d++){for(var c=1;c<=NUM_CHAMBERS;c++){var colIndex=(d-1)*NUM_CHAMBERS+c,temp=parseFloat(row[colIndex]);if(isNaN(temp)||temp===0)continue;var key="D"+d+"C"+c;if(!latestState[key]||rowTime>latestState[key].rowTime)latestState[key]={temp,timestamp:Utilities.formatDate(rowTime,tz,"dd/MM/yyyy HH:mm:ss"),rowTime,dryer:d,chamber:c};}}}
-    var latestTemps={};
-    for(var key in latestState){var state=latestState[key],d=state.dryer,c=state.chamber,temp=state.temp,timestamp=state.timestamp,rowTime=state.rowTime;latestTemps["D"+d+"C"+c]=temp;var upThresh=(thresholds["D"+d]&&thresholds["D"+d]["C"+c]!==undefined)?thresholds["D"+d]["C"+c]:DEFAULT_UPPER_THRESHOLD,loThresh=(lowerThresholds["D"+d]&&lowerThresholds["D"+d]["C"+c]!==undefined)?lowerThresholds["D"+d]["C"+c]:DEFAULT_LOWER_THRESHOLD;processThresholdAlert(alertSheet,d,c,temp,upThresh,timestamp,rowTime,now,"HIGH");if(loThresh>0)processThresholdAlert(alertSheet,d,c,temp,loThresh,timestamp,rowTime,now,"LOW");}
-    var currentlyActiveKeys={};getActiveAlerts(alertSheet).forEach(function(a){currentlyActiveKeys["D"+a.dryer+"C"+a.chamber+"_"+a.alertType]=true;});
-    var resolvedAlerts=[];Object.keys(previouslyActiveKeys).forEach(function(k){if(!currentlyActiveKeys[k])resolvedAlerts.push(previouslyActiveKeys[k]);});
-    var intervals=getEscalationIntervals(emailSheet),emails=getEscalationEmails(emailSheet),telegramIds=getTelegramChatIds(),activeAlerts=getActiveAlerts(alertSheet),cache=CacheService.getScriptCache(),alertsToSend={level1:[],level2:[],level3:[]};
-    activeAlerts.forEach(function(alert){var startTime=parseSheetTimestamp(alert.startTime);if(!startTime)return;var elapsedMs=now-startTime,keyBase="esc_"+alert.dryer+"_"+alert.chamber+"_"+alert.alertType+"_";
-      var lastSent1=cache.get(keyBase+"l1"),shouldSend1=lastSent1===null||(now-parseInt(lastSent1)>=intervals.level1);if(shouldSend1){alertsToSend.level1.push(alert);cache.put(keyBase+"l1",now.getTime().toString(),86400);}
-      var lastSent2=cache.get(keyBase+"l2"),shouldSend2=lastSent2===null?(elapsedMs>=intervals.level2):(now-parseInt(lastSent2)>=intervals.level2);if(shouldSend2){alertsToSend.level2.push(alert);cache.put(keyBase+"l2",now.getTime().toString(),86400);}
-      var lastSent3=cache.get(keyBase+"l3"),shouldSend3=lastSent3===null?(elapsedMs>=intervals.level3):(now-parseInt(lastSent3)>=intervals.level3);if(shouldSend3){alertsToSend.level3.push(alert);cache.put(keyBase+"l3",now.getTime().toString(),86400);}
+
+    var thresholds=readThresholds(threshSheet),
+        lowerThresholds=readLowerThresholds(threshSheet),
+        hys=readHysteresis(threshSheet),
+        now=new Date(),
+        tz=Session.getScriptTimeZone(),
+        emails=getEscalationEmails(emailSheet),
+        telegramIds=getTelegramChatIds();
+
+    // ── All recipients (used for resolution emails) ──
+    var allRecipients=[];
+    [emails.level1,emails.level2,emails.level3].forEach(function(lvl){
+      lvl.forEach(function(em){if(allRecipients.indexOf(em)===-1)allRecipients.push(em);});
     });
+    // ── MCU offline/online alerts go to Level 3 only (col C of Email IDs sheet) ──
+    var mcuAlertRecipients = emails.level3.slice();
+
+    // ============================================================
+    // FIX 2: MCU ONLINE/OFFLINE STATE TRACKING
+    // ============================================================
+    var mcuOnline = isMcuCurrentlyOnline(statusSheet);
+    var prevOfflineState = getMcuOfflineState();
+    // prevOfflineState format: "offline:<ms>:<formattedTs>" or null
+
+    if (!mcuOnline) {
+      // MCU is currently offline
+      if (prevOfflineState === null) {
+        // Transition: online → offline. Send ONE email.
+        var offlineNow = now;
+        var offlineTsStr = Utilities.formatDate(offlineNow, tz, "dd/MM/yyyy HH:mm:ss");
+        setMcuOfflineState("offline:" + offlineNow.getTime() + ":" + offlineTsStr);
+        Logger.log("MCU went offline at " + offlineTsStr + ". Sending offline notification.");
+        sendMcuOfflineEmail(mcuAlertRecipients, telegramIds, offlineNow);
+        // Also clear all escalation cache keys so they don't fire when MCU comes back
+        try {
+          var cache = CacheService.getScriptCache();
+          // We cannot enumerate keys easily, but setting a blanket marker is enough
+          cache.put("mcu_was_offline", "1", 86400);
+        } catch(e) {}
+      }
+      // MCU is offline → do NOT check temps, do NOT send escalation. Return.
+      Logger.log("MCU is offline. Skipping temperature alert check.");
+      return;
+    } else {
+      // MCU is currently online
+      if (prevOfflineState !== null) {
+        // Transition: offline → online. Send ONE back-online email.
+        var parts = prevOfflineState.split(":");
+        var offlineMs = parseInt(parts[1]) || (now.getTime() - 60000);
+        setMcuOfflineState(null);
+        Logger.log("MCU came back online at " + Utilities.formatDate(now, tz, "dd/MM/yyyy HH:mm:ss"));
+        sendMcuOnlineEmail(mcuAlertRecipients, telegramIds, offlineMs, now);
+        // Clear escalation cache so we start fresh — prevents stale escalation firing
+        try {
+          var cache2 = CacheService.getScriptCache();
+          cache2.remove("mcu_was_offline");
+        } catch(e) {}
+        // Also resolve any ACTIVE alerts that were open when MCU went offline
+        resolveAllActiveAlerts(alertSheet, Utilities.formatDate(now, tz, "dd/MM/yyyy HH:mm:ss"), now);
+      }
+    }
+
+    // ============================================================
+    // FIX 1: Read recent temperature data and apply HYSTERESIS
+    // effectiveUpperTrigger = upper threshold + upper hysteresis
+    // effectiveLowerTrigger = lower threshold + lower hysteresis
+    // ============================================================
+    var lookbackTime=new Date(now.getTime()-LOOKBACK_MINUTES*60*1000),lastRow=dataSheet.getLastRow();
+    if(lastRow<2)return;
+    var rowsToCheck=Math.min(20,lastRow-1),startRow=lastRow-rowsToCheck+1;
+    var data=dataSheet.getRange(startRow,1,rowsToCheck,TOTAL_CHANNELS+1).getValues();
+
+    var previouslyActiveKeys={},prevActiveAlerts=getActiveAlerts(alertSheet);
+    prevActiveAlerts.forEach(function(a){previouslyActiveKeys["D"+a.dryer+"C"+a.chamber+"_"+a.alertType]=a;});
+
+    var latestState={};
+    for(var i=0;i<data.length;i++){
+      var row=data[i],rowTime=null;
+      if(row[0])rowTime=(row[0]instanceof Date)?row[0]:parseSheetTimestamp(row[0].toString());
+      if(!rowTime||rowTime<lookbackTime)continue;
+      for(var d=1;d<=NUM_DRYERS;d++){for(var c=1;c<=NUM_CHAMBERS;c++){
+        var colIndex=(d-1)*NUM_CHAMBERS+c,temp=parseFloat(row[colIndex]);
+        if(isNaN(temp)||temp===0)continue;
+        var key="D"+d+"C"+c;
+        if(!latestState[key]||rowTime>latestState[key].rowTime)
+          latestState[key]={temp,timestamp:Utilities.formatDate(rowTime,tz,"dd/MM/yyyy HH:mm:ss"),rowTime,dryer:d,chamber:c};
+      }}
+    }
+
+    var latestTemps={};
+    for(var key in latestState){
+      var state=latestState[key],d=state.dryer,c=state.chamber,temp=state.temp,timestamp=state.timestamp,rowTime=state.rowTime;
+      latestTemps["D"+d+"C"+c]=temp;
+      var upThresh=(thresholds["D"+d]&&thresholds["D"+d]["C"+c]!==undefined)?thresholds["D"+d]["C"+c]:DEFAULT_UPPER_THRESHOLD;
+      var loThresh=(lowerThresholds["D"+d]&&lowerThresholds["D"+d]["C"+c]!==undefined)?lowerThresholds["D"+d]["C"+c]:DEFAULT_LOWER_THRESHOLD;
+      // Apply hysteresis to determine trigger point
+      var effectiveUpperTrigger = upThresh + hys.upper;
+      var effectiveLowerTrigger = loThresh + hys.lower;
+      // Pass effectiveTrigger for violation check, but store actual threshold in alert row
+      processThresholdAlertWithHys(alertSheet,d,c,temp,upThresh,effectiveUpperTrigger,timestamp,rowTime,now,"HIGH");
+      if(loThresh>0) processThresholdAlertWithHys(alertSheet,d,c,temp,loThresh,effectiveLowerTrigger,timestamp,rowTime,now,"LOW");
+    }
+
+    var currentlyActiveKeys={};
+    getActiveAlerts(alertSheet).forEach(function(a){currentlyActiveKeys["D"+a.dryer+"C"+a.chamber+"_"+a.alertType]=true;});
+
+    var resolvedAlerts=[];
+    Object.keys(previouslyActiveKeys).forEach(function(k){if(!currentlyActiveKeys[k])resolvedAlerts.push(previouslyActiveKeys[k]);});
+
+    var intervals=getEscalationIntervals(emailSheet),activeAlerts=getActiveAlerts(alertSheet);
+    var cache=CacheService.getScriptCache(),alertsToSend={level1:[],level2:[],level3:[]};
+
+    activeAlerts.forEach(function(alert){
+      var startTime=parseSheetTimestamp(alert.startTime);if(!startTime)return;
+      var elapsedMs=now-startTime,keyBase="esc_"+alert.dryer+"_"+alert.chamber+"_"+alert.alertType+"_";
+      var lastSent1=cache.get(keyBase+"l1"),shouldSend1=lastSent1===null||(now-parseInt(lastSent1)>=intervals.level1);
+      if(shouldSend1){alertsToSend.level1.push(alert);cache.put(keyBase+"l1",now.getTime().toString(),86400);}
+      var lastSent2=cache.get(keyBase+"l2"),shouldSend2=lastSent2===null?(elapsedMs>=intervals.level2):(now-parseInt(lastSent2)>=intervals.level2);
+      if(shouldSend2){alertsToSend.level2.push(alert);cache.put(keyBase+"l2",now.getTime().toString(),86400);}
+      var lastSent3=cache.get(keyBase+"l3"),shouldSend3=lastSent3===null?(elapsedMs>=intervals.level3):(now-parseInt(lastSent3)>=intervals.level3);
+      if(shouldSend3){alertsToSend.level3.push(alert);cache.put(keyBase+"l3",now.getTime().toString(),86400);}
+    });
+
     if(alertsToSend.level1.length>0&&emails.level1.length>0)sendEscalationEmail(1,alertsToSend.level1,emails.level1,intervals);
     if(alertsToSend.level2.length>0&&emails.level2.length>0)sendEscalationEmail(2,alertsToSend.level2,emails.level2,intervals);
     if(alertsToSend.level3.length>0&&emails.level3.length>0)sendEscalationEmail(3,alertsToSend.level3,emails.level3,intervals);
     if(alertsToSend.level1.length>0&&telegramIds.length>0){var intervalMin=Math.round(intervals.level1/60000);sendTelegramMessage(telegramIds,buildTelegramEscalationMessage(alertsToSend.level1,intervalMin));}
-    if(resolvedAlerts.length>0){var allRecipients=[];[emails.level1,emails.level2,emails.level3].forEach(function(lvl){lvl.forEach(function(em){if(allRecipients.indexOf(em)===-1)allRecipients.push(em);});});
-      resolvedAlerts.forEach(function(alert){var tempKey="D"+alert.dryer+"C"+alert.chamber,currentTemp=latestTemps[tempKey]!==undefined?latestTemps[tempKey]:NaN,resolvedInfo=findResolvedAlertInfo(alertSheet,alert.dryer,alert.chamber,alert.alertType,alert.startTime),resolvedTime=resolvedInfo?resolvedInfo.endTime:formatTsForOutput(now),durSec=resolvedInfo?resolvedInfo.durationSeconds:0;
+    if(alertsToSend.level1.length>0){var intervalMin=Math.round(intervals.level1/60000);sendWhatsappMessage(buildWhatsappAlertMessage(alertsToSend.level1,intervalMin));}
+
+    if(resolvedAlerts.length>0){
+      resolvedAlerts.forEach(function(alert){
+        var tempKey="D"+alert.dryer+"C"+alert.chamber,currentTemp=latestTemps[tempKey]!==undefined?latestTemps[tempKey]:NaN;
+        var resolvedInfo=findResolvedAlertInfo(alertSheet,alert.dryer,alert.chamber,alert.alertType,alert.startTime);
+        var resolvedTime=resolvedInfo?resolvedInfo.endTime:formatTsForOutput(now),durSec=resolvedInfo?resolvedInfo.durationSeconds:0;
         var alertForMsg={dryer:alert.dryer,chamber:alert.chamber,alertType:alert.alertType,startTime:alert.startTime,resolvedTime,peak:alert.peak,threshold:alert.threshold};
-        if(allRecipients.length>0)sendResolutionEmail(alertForMsg,currentTemp,durSec,allRecipients);
+        // Only send resolution to levels that actually received an escalation for this alert
+        var cacheKeyBase="esc_"+alert.dryer+"_"+alert.chamber+"_"+alert.alertType+"_";
+        var resolveRecipients=[];
+        if(cache.get(cacheKeyBase+"l1")!==null) emails.level1.forEach(function(e){if(resolveRecipients.indexOf(e)===-1)resolveRecipients.push(e);});
+        if(cache.get(cacheKeyBase+"l2")!==null) emails.level2.forEach(function(e){if(resolveRecipients.indexOf(e)===-1)resolveRecipients.push(e);});
+        if(cache.get(cacheKeyBase+"l3")!==null) emails.level3.forEach(function(e){if(resolveRecipients.indexOf(e)===-1)resolveRecipients.push(e);});
+        if(resolveRecipients.length>0)sendResolutionEmail(alertForMsg,currentTemp,durSec,resolveRecipients);
         if(telegramIds.length>0&&!isNaN(currentTemp))sendTelegramMessage(telegramIds,buildTelegramResolutionMessage(alertForMsg,currentTemp,durSec));
         else if(telegramIds.length>0)sendTelegramMessage(telegramIds,buildTelegramResolutionMessageNoTemp(alertForMsg,durSec));
+        if(!isNaN(currentTemp)) sendWhatsappMessage(buildWhatsappResolutionMessage(alertForMsg, currentTemp, durSec));
         var cacheKeyBase="esc_"+alert.dryer+"_"+alert.chamber+"_"+alert.alertType+"_";
         try{cache.remove(cacheKeyBase+"l1");cache.remove(cacheKeyBase+"l2");cache.remove(cacheKeyBase+"l3");}catch(ce){}
         Logger.log("Resolution notification sent: Dryer "+alert.dryer+" Chamber "+alert.chamber+" ["+alert.alertType+"]");
@@ -681,13 +1044,83 @@ function autoCheckAlerts(){
   }catch(err){Logger.log("ERROR in autoCheckAlerts: "+err.toString());}
 }
 
+// =========================================================
+// resolveAllActiveAlerts — called when MCU comes back online
+// Marks all ACTIVE alerts as RESOLVED with the given timestamp
+// =========================================================
+function resolveAllActiveAlerts(alertSheet, resolvedTsStr, now) {
+  try {
+    var lastRow = alertSheet.getLastRow();
+    if (lastRow < 2) return;
+    var data = alertSheet.getRange(2, 1, lastRow - 1, 10).getValues();
+    for (var i = 0; i < data.length; i++) {
+      if (data[i][8].toString() === "ACTIVE") {
+        var startTs = parseSheetTimestamp(data[i][2].toString());
+        var dur = startTs ? Math.max(0, Math.round((now - startTs) / 1000)) : 0;
+        alertSheet.getRange(i + 2, 4).setValue(resolvedTsStr);
+        alertSheet.getRange(i + 2, 8).setValue(dur);
+        alertSheet.getRange(i + 2, 9).setValue("RESOLVED");
+        Logger.log("Auto-resolved alert for Dryer " + data[i][0] + " Chamber " + data[i][1] + " because MCU came back online.");
+      }
+    }
+  } catch(e) {
+    Logger.log("resolveAllActiveAlerts error: " + e.toString());
+  }
+}
+
+// =========================================================
+// processThresholdAlertWithHys — uses effectiveTrigger for
+// the violation decision, but stores the raw threshold in the alert row
+// =========================================================
+function processThresholdAlertWithHys(alertSheet, dryer, chamber, temp, threshold, effectiveTrigger, timestamp, rowTime, now, alertType) {
+  var tz = Session.getScriptTimeZone();
+  var cleanTs = Utilities.formatDate(rowTime, tz, "dd/MM/yyyy HH:mm:ss");
+  var openRow = findOpenAlertRow(alertSheet, dryer, chamber, alertType);
+  // Violation check uses effectiveTrigger (threshold + hysteresis)
+ // Trigger uses hysteresis; resolution uses raw threshold (no hysteresis)
+var violated = (alertType === "HIGH") ? (temp > effectiveTrigger) : (temp < effectiveTrigger);
+// For resolution: only clear if temp is back within base threshold (no hysteresis buffer)
+var stillViolating = (alertType === "HIGH") ? (temp > threshold) : (temp < threshold);
+  if (violated) {
+    if (openRow === -1) {
+      // New alert — store actual threshold, not effective trigger
+      alertSheet.appendRow([dryer, chamber, cleanTs, "Not Resolved", temp, threshold,
+        parseFloat((alertType === "HIGH" ? (temp - threshold) : (threshold - temp)).toFixed(2)),
+        0, "ACTIVE", alertType, ""]);
+    } else {
+      var rowData = alertSheet.getRange(openRow, 1, 1, 10).getValues()[0];
+      var existPeak = parseFloat(rowData[4]);
+      var startTs = parseSheetTimestamp(rowData[2].toString());
+      var durSec = startTs ? Math.max(0, Math.round((now - startTs) / 1000)) : 0;
+      var newPeak = (alertType === "HIGH") ? Math.max(temp, existPeak) : Math.min(temp, existPeak);
+      var newOver = parseFloat((alertType === "HIGH" ? (newPeak - threshold) : (threshold - newPeak)).toFixed(2));
+      alertSheet.getRange(openRow, 1, 1, 10).setValues([[rowData[0], rowData[1], rowData[2], "Not Resolved", newPeak, rowData[5], newOver, durSec, "ACTIVE", alertType]]);
+    }
+  } else if (!stillViolating) {
+    // No violation AND back within base threshold — resolve any open alert for this channel
+    if (openRow !== -1) {
+      var rowData2 = alertSheet.getRange(openRow, 1, 1, 10).getValues()[0];
+      var startTs2 = parseSheetTimestamp(rowData2[2].toString());
+      var durSec2 = startTs2 ? Math.max(0, Math.round((rowTime - startTs2) / 1000)) : 0;
+      alertSheet.getRange(openRow, 4).setValue(cleanTs);
+      alertSheet.getRange(openRow, 8).setValue(durSec2);
+      alertSheet.getRange(openRow, 9).setValue("RESOLVED");
+    }
+  }
+}
+
 function findResolvedAlertInfo(alertSheet,dryer,chamber,alertType,startTime){var lastRow=alertSheet.getLastRow();if(lastRow<2)return null;var data=alertSheet.getRange(2,1,lastRow-1,10).getValues();for(var i=data.length-1;i>=0;i--){if(parseInt(data[i][0])===dryer&&parseInt(data[i][1])===chamber&&data[i][9].toString()===alertType&&data[i][2].toString()===startTime&&data[i][8].toString()==="RESOLVED")return{endTime:data[i][3].toString(),durationSeconds:parseInt(data[i][7])||0};}return null;}
 
 function sendResolutionEmail(alert,currentTemp,durSec,recipients){if(!recipients||recipients.length===0)return;var typeStr=alert.alertType==="LOW"?"BELOW LOWER":"ABOVE UPPER",subject="✅ RESOLVED – Dryer Temperature Alert | Dryer "+alert.dryer+" Chamber "+alert.chamber;var body="Dryer Temperature Alert RESOLVED\n============================================================\n\nThe temperature alert listed below has now been resolved.\n\n  Dryer         : "+alert.dryer+"\n  Chamber       : "+alert.chamber+"\n  Alert Type    : "+typeStr+" THRESHOLD\n  Alert Started : "+alert.startTime+"\n  Resolved At   : "+alert.resolvedTime+"\n  Duration      : "+formatDurationGas(durSec)+"\n  Peak Temp     : "+alert.peak.toFixed(2)+"°C\n  Threshold     : "+alert.threshold+"°C\n";if(!isNaN(currentTemp)){var diff=Math.abs(currentTemp-alert.threshold).toFixed(2),diffLabel=alert.alertType==="LOW"?diff+"°C above lower threshold":diff+"°C below upper threshold";body+="  Current Temp  : "+currentTemp.toFixed(2)+"°C  ("+diffLabel+")\n";}body+="\n--\nCPIL Chennai - Dryer Temperature Monitoring System (Auto-alert system. Do not reply to this mail)";try{GmailApp.sendEmail(recipients.join(","),subject,body);}catch(err){try{MailApp.sendEmail({to:recipients.join(","),subject,body});}catch(err2){Logger.log("Failed to send resolution email: "+err2.toString());}}}
 
 function buildTelegramResolutionMessageNoTemp(alert,durSec){var lines=[];lines.push("<b>✅ Alert RESOLVED</b>\n");var typeStr=alert.alertType==="LOW"?"⬇️ Below Lower":"⬆️ Above Upper";lines.push("<b>Dryer "+alert.dryer+" – Chamber "+alert.chamber+"</b>");lines.push("  Type: "+typeStr+" Threshold");lines.push("  Alert started: "+alert.startTime);lines.push("  Resolved at:   "+alert.resolvedTime);lines.push("  Peak temp:     "+alert.peak.toFixed(2)+"°C");lines.push("  Threshold:     "+alert.threshold+"°C");lines.push("  Duration:      "+formatDurationGas(durSec||0));lines.push("");lines.push("— CPIL Chennai Dryer Temperature Monitoring System");return lines.join("\n");}
 
-function processThresholdAlert(alertSheet,dryer,chamber,temp,threshold,timestamp,rowTime,now,alertType){var tz=Session.getScriptTimeZone(),cleanTs=Utilities.formatDate(rowTime,tz,"dd/MM/yyyy HH:mm:ss"),openRow=findOpenAlertRow(alertSheet,dryer,chamber,alertType),violated=(alertType==="HIGH")?(temp>threshold):(temp<threshold);if(violated){if(openRow===-1){alertSheet.appendRow([dryer,chamber,cleanTs,"Not Resolved",temp,threshold,parseFloat((alertType==="HIGH"?(temp-threshold):(threshold-temp)).toFixed(2)),0,"ACTIVE",alertType,""]);}else{var rowData=alertSheet.getRange(openRow,1,1,10).getValues()[0],existPeak=parseFloat(rowData[4]),startTs=parseSheetTimestamp(rowData[2].toString()),durSec=startTs?Math.max(0,Math.round((now-startTs)/1000)):0,newPeak=(alertType==="HIGH")?Math.max(temp,existPeak):Math.min(temp,existPeak),newOver=parseFloat((alertType==="HIGH"?(newPeak-threshold):(threshold-newPeak)).toFixed(2));alertSheet.getRange(openRow,1,1,10).setValues([[rowData[0],rowData[1],rowData[2],"Not Resolved",newPeak,rowData[5],newOver,durSec,"ACTIVE",alertType]]);}}else{if(openRow!==-1){var rowData2=alertSheet.getRange(openRow,1,1,10).getValues()[0],startTs2=parseSheetTimestamp(rowData2[2].toString()),durSec2=startTs2?Math.max(0,Math.round((rowTime-startTs2)/1000)):0;alertSheet.getRange(openRow,4).setValue(cleanTs);alertSheet.getRange(openRow,8).setValue(durSec2);alertSheet.getRange(openRow,9).setValue("RESOLVED");}}}
+// =========================================================
+// OLD processThresholdAlert kept for backward compat (not used in autoCheckAlerts now)
+// =========================================================
+function processThresholdAlert(alertSheet,dryer,chamber,temp,threshold,timestamp,rowTime,now,alertType){
+  processThresholdAlertWithHys(alertSheet,dryer,chamber,temp,threshold,threshold,timestamp,rowTime,now,alertType);
+}
 
 function getActiveAlerts(alertSheet){var lastRow=alertSheet.getLastRow();if(lastRow<2)return[];var data=alertSheet.getRange(2,1,lastRow-1,10).getValues(),active=[];data.forEach(function(row){if(row[8].toString()==="ACTIVE")active.push({dryer:parseInt(row[0]),chamber:parseInt(row[1]),startTime:row[2].toString(),peak:parseFloat(row[4]),threshold:parseFloat(row[5]),overBy:parseFloat(row[6]),alertType:row[9].toString()});});return active;}
 function getEscalationIntervals(emailSheet){var x=5,y=10,z=30;try{var xi=parseInt(emailSheet.getRange("E2").getValue()),yi=parseInt(emailSheet.getRange("F2").getValue()),zi=parseInt(emailSheet.getRange("G2").getValue());if(!isNaN(xi)&&xi>0)x=xi;if(!isNaN(yi)&&yi>0)y=yi;if(!isNaN(zi)&&zi>0)z=zi;}catch(e){}return{level1:x*60*1000,level2:y*60*1000,level3:z*60*1000};}
@@ -704,7 +1137,19 @@ function handleGetEmails(emailSheet){ensureEmailHeaders(emailSheet);return jsonR
 function checkDeviceStatus(){try{var ss=SpreadsheetApp.getActiveSpreadsheet(),statusSheet=getOrCreateSheet(ss,"Status Sheet");ensureStatusHeaders(statusSheet);var timeout=getStatusTimeout(statusSheet),numRows=statusSheet.getLastRow();if(numRows<2)return;var now=new Date(),data=statusSheet.getRange(2,1,numRows-1,3+NUM_CHAMBERS).getValues(),mcuOnline=false;data.forEach(function(row){var lastTs=parseSheetTimestamp(row[2].toString());if(lastTs&&(now-lastTs)/1000<=timeout)mcuOnline=true;});data.forEach(function(row,idx){var lastTs=parseSheetTimestamp(row[2].toString()),allZero=true;for(var c=0;c<NUM_CHAMBERS;c++){if(row[3+c]!==0){allZero=false;break;}}var newStatus;if(!mcuOnline)newStatus="UNKNOWN";else if(!lastTs||(now-lastTs)/1000>timeout)newStatus="OFFLINE";else newStatus=allZero?"OFFLINE":"ONLINE";statusSheet.getRange(idx+2,2).setValue(newStatus);});Logger.log("Device status check complete.");}catch(err){Logger.log("checkDeviceStatus error: "+err.toString());}}
 
 function ensureDataHeaders(sheet){if(sheet.getLastRow()>0)return;var headers=["Timestamp"];for(var d=1;d<=NUM_DRYERS;d++)for(var c=1;c<=NUM_CHAMBERS;c++)headers.push("Dryer "+d+" Chamber "+c);sheet.appendRow(headers);sheet.getRange(1,1,1,headers.length).setFontWeight("bold");}
-function ensureThresholdHeaders(sheet){if(sheet.getLastRow()>=3)return;if(sheet.getLastRow()===0){var headers=["Label"];for(var d=1;d<=NUM_DRYERS;d++)for(var c=1;c<=NUM_CHAMBERS;c++)headers.push("Dryer "+d+" Chamber "+c);sheet.appendRow(headers);sheet.getRange(1,1,1,headers.length).setFontWeight("bold");}if(sheet.getLastRow()<2){var upRow=["Upper Threshold"];for(var i=0;i<TOTAL_CHANNELS;i++)upRow.push(80);sheet.appendRow(upRow);sheet.getRange(2,1).setFontWeight("bold");}if(sheet.getLastRow()<3){var loRow=["Lower Threshold"];for(var j=0;j<TOTAL_CHANNELS;j++)loRow.push(DEFAULT_LOWER_THRESHOLD);sheet.appendRow(loRow);sheet.getRange(3,1).setFontWeight("bold");}}
+
+function ensureThresholdHeaders(sheet){
+  if(sheet.getLastRow()>=3)return;
+  if(sheet.getLastRow()===0){var headers=["Label"];for(var d=1;d<=NUM_DRYERS;d++)for(var c=1;c<=NUM_CHAMBERS;c++)headers.push("Dryer "+d+" Chamber "+c);sheet.appendRow(headers);sheet.getRange(1,1,1,headers.length).setFontWeight("bold");}
+  if(sheet.getLastRow()<2){var upRow=["Upper Threshold"];for(var i=0;i<TOTAL_CHANNELS;i++)upRow.push(80);sheet.appendRow(upRow);sheet.getRange(2,1).setFontWeight("bold");}
+  if(sheet.getLastRow()<3){var loRow=["Lower Threshold"];for(var j=0;j<TOTAL_CHANNELS;j++)loRow.push(DEFAULT_LOWER_THRESHOLD);sheet.appendRow(loRow);sheet.getRange(3,1).setFontWeight("bold");}
+  // Ensure rows 4–7 exist with labels so hysteresis cells are accessible
+  if(sheet.getLastRow()<4){sheet.appendRow(["(spare)"]);}
+  if(sheet.getLastRow()<5){sheet.appendRow(["(spare)"]);}
+  if(sheet.getLastRow()<6){sheet.appendRow(["Upper Hysteresis (°C)",0]);sheet.getRange(6,1).setFontWeight("bold");}
+  if(sheet.getLastRow()<7){sheet.appendRow(["Lower Hysteresis (°C)",0]);sheet.getRange(7,1).setFontWeight("bold");}
+}
+
 function ensureStatusHeaders(sheet){if(sheet.getLastRow()>0)return;var headers=["DeviceID","Status","LastSeen"];for(var c=1;c<=NUM_CHAMBERS;c++)headers.push("C"+c);sheet.appendRow(headers);sheet.getRange(1,1,1,headers.length).setFontWeight("bold");sheet.getRange("O1").setValue("StatusTimeout(sec)");sheet.getRange("P1").setValue("edit P2");sheet.getRange("P2").setValue(DEFAULT_STATUS_TIMEOUT);sheet.getRange("Q1").setValue("MergeWindow(sec)");sheet.getRange("Q2").setValue(DEFAULT_MERGE_WINDOW);var tz=Session.getScriptTimeZone(),ts=Utilities.formatDate(new Date(),tz,"dd/MM/yyyy HH:mm:ss");for(var d=1;d<=NUM_DRYERS;d++){var rowData=[d,"ONLINE",ts];for(var c=1;c<=NUM_CHAMBERS;c++)rowData.push(0);sheet.appendRow(rowData);}}
 function ensureEmailHeaders(sheet){if(sheet.getLastRow()===0){sheet.appendRow(["Level1 Email","Level2 Email","Level3 Email","(unused)","L1 Interval (min)","L2 Interval (min)","L3 Interval (min)"]);sheet.getRange(1,1,1,7).setFontWeight("bold");}}
 
@@ -716,7 +1161,50 @@ function jsonResponse(obj){return ContentService.createTextOutput(JSON.stringify
 
 function handleAiChat(e,ss,dataSheet,threshSheet,statusSheet){var query=(e.parameter&&e.parameter.query)?e.parameter.query.toString():"";if(!query)return jsonResponse({error:"No query provided"});var apiKey="";try{apiKey=PropertiesService.getScriptProperties().getProperty("ANTHROPIC_API_KEY")||"";}catch(err){}if(!apiKey)return jsonResponse({error:"ANTHROPIC_API_KEY not set in Script Properties."});}
 
+function handleGetApiKeys(ss) {
+  try {
+    var sheet = ss.getSheetByName("APIs");
+    if (!sheet) return jsonResponse({ keys: [] });
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return jsonResponse({ keys: [] });
+    var data = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    var keys = data.map(function(row) { return row[0].toString().trim(); }).filter(function(k) { return k.length > 0; });
+    return jsonResponse({ keys: keys });
+  } catch (err) {
+    return jsonResponse({ error: err.toString() });
+  }
+}
+
 function createTriggers(){ScriptApp.getProjectTriggers().forEach(function(t){ScriptApp.deleteTrigger(t);});ScriptApp.newTrigger('checkDeviceStatus').timeBased().everyMinutes(1).create();ScriptApp.newTrigger('autoCheckAlerts').timeBased().everyMinutes(1).create();ScriptApp.newTrigger('autoGenerateAvailabilitySheets').timeBased().everyMinutes(5).create();Logger.log("Triggers created.");}
 
 function testTelegramAlert(){var ids=getTelegramChatIds();if(ids.length===0){Logger.log("❌ No TELEGRAM_CHAT_IDS found.");return;}var msg="<b>✅ Dryer temperature monitor – Telegram Test</b>\n\nBot is connected and working correctly.\n\n— CPIL Chennai Dryer Temperature Monitoring System";sendTelegramMessage(ids,msg);Logger.log("✅ Test message sent.");}
 function testEmailAlert(){var ss=SpreadsheetApp.getActiveSpreadsheet(),emailSheet=getOrCreateSheet(ss,"Email IDs"),emails=getEscalationEmails(emailSheet),allRecipients=[];[emails.level1,emails.level2,emails.level3].forEach(function(lvl){lvl.forEach(function(em){if(allRecipients.indexOf(em)===-1)allRecipients.push(em);});});if(allRecipients.length===0){Logger.log("❌ No email recipients found.");return;}var subject="✅ Dryer temperature monitor – Email Test",body="CPIL Chennai Temperature Monitoring System\n\nThis is a test email.\n\n--\nCPIL Chennai Dryer Temperature Monitoring System";try{GmailApp.sendEmail(allRecipients.join(","),subject,body);Logger.log("✅ Test email sent via GmailApp.");}catch(err){try{MailApp.sendEmail({to:allRecipients.join(","),subject,body});}catch(err2){Logger.log("❌ MailApp also failed: "+err2.toString());}}}
+
+function testWhatsappMessage() {
+  var config = getTwilioConfig();
+  if (!config) { Logger.log("❌ Twilio config missing or incomplete in APIs sheet (B2:B5)."); return; }
+  var msg = "*✅ Dryer temperature monitor – WhatsApp Test*\n\nYour Twilio WhatsApp sandbox is connected correctly.\n\n— CPIL Chennai Dryer Temperature Monitoring System";
+  sendWhatsappMessage(msg);
+  Logger.log("✅ Test WhatsApp message initiated to: " + config.to);
+}
+
+function testMcuOfflineEmail() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var emailSheet = getOrCreateSheet(ss, "Email IDs");
+  var emails = getEscalationEmails(emailSheet);
+  var mcuAlertRecipients = emails.level3.slice(); // Level 3 only (col C)
+  var telegramIds = getTelegramChatIds();
+  sendMcuOfflineEmail(mcuAlertRecipients, telegramIds, new Date());
+  Logger.log("🔴 MCU offline test notification sent to Level 3 only: " + mcuAlertRecipients.join(", "));
+}
+
+function testMcuOnlineEmail() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var emailSheet = getOrCreateSheet(ss, "Email IDs");
+  var emails = getEscalationEmails(emailSheet);
+  var mcuAlertRecipients = emails.level3.slice(); // Level 3 only (col C)
+  var telegramIds = getTelegramChatIds();
+  var fakeOfflineMs = new Date().getTime() - 65 * 60 * 1000; // 65 min ago
+  sendMcuOnlineEmail(mcuAlertRecipients, telegramIds, fakeOfflineMs, new Date());
+  Logger.log("🟢 MCU back-online test notification sent to Level 3 only: " + mcuAlertRecipients.join(", "));
+}
