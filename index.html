@@ -4199,7 +4199,7 @@ function addGapThresholdSlider() {
             document.getElementById('modeCsvBtn').classList.toggle('active', mode === 'csv');
             
             document.getElementById('homeScreen').style.display = 'none';
-            // For online mode: only show screen after preload; overlay handles the wait
+            // Show online screen IMMEDIATELY — no blocking overlay on first load
             document.getElementById('onlineScreen').style.display = mode === 'online' ? 'block' : 'none';
             document.getElementById('csvScreen').style.display = mode === 'csv' ? 'block' : 'none';
             
@@ -4207,13 +4207,9 @@ function addGapThresholdSlider() {
             
             if (mode === 'online') {
                 if (!isConnected) {
-                    // Show overlay immediately before anything else loads
-                    const overlay = document.getElementById('initLoadOverlay');
-                    if (overlay && !_preload24hDone) {
-                        overlay.style.display = 'flex';
-                        setInitProgress(0, 'CONNECTING TO SHEET...');
-                    }
-                    setTimeout(() => connectSheet(), 300);
+                    // NO full-screen overlay on first load — UI shows immediately
+                    // connectSheet fetches status fast then does everything in background
+                    setTimeout(() => connectSheet(), 50);
                 }
                 stopQuoteDisplay();
             } else if (mode === 'csv') {
@@ -4271,19 +4267,19 @@ function addGapThresholdSlider() {
                 for (let c = 1; c <= NUM_CHAMBERS; c++) {
                     const colorIndex = (d-1) * NUM_CHAMBERS + (c-1);
                     const chCol = CHAMBER_COLORS[colorIndex];
-                    chambers += `<div class="chamber-cell chamber-inactive" id="cell_d${d}c${c}" style="border-color: #666">
-                        <div class="ch-label" id="label_d${d}c${c}" style="color: ${chCol}; opacity:0.7;">CH${c}</div>
-                        <div class="ch-temp normal" id="temp_d${d}c${c}" style="color: #666">--.-</div>
+                    chambers += `<div class="chamber-cell chamber-inactive" id="cell_d${d}c${c}" style="border-color: #444">
+                        <div class="ch-label" id="label_d${d}c${c}" style="color: ${chCol}; opacity:0.5;">CH${c}</div>
+                        <div class="ch-temp normal" id="temp_d${d}c${c}" style="color: #555">···</div>
                     </div>`;
                 }
                 grid.innerHTML += `
                     <div class="dryer-card" id="dryerCard${d}">
                         <div class="dryer-header">
                             <div class="dryer-title">DRYER ${d}</div>
-                            <div class="status-badge offline" id="badge${d}">OFFLINE</div>
+                            <div class="status-badge unknown" id="badge${d}" style="animation:pulse 1.2s infinite;opacity:0.7;">CONNECTING</div>
                         </div>
                         <div class="chambers-grid">${chambers}</div>
-                        <div class="last-seen" id="lastSeen${d}">Last seen: --</div>
+                        <div class="last-seen" id="lastSeen${d}" style="color:rgba(0,255,204,0.25);">Connecting to sheet...</div>
                     </div>`;
             }
         }
@@ -4591,21 +4587,23 @@ function addGapThresholdSlider() {
         async function connectSheet() {
             if (!sheetUrl) { showToast('No API URL configured', 'error'); return; }
             isConnected = true;
-            await fetchStatusTimeout();
-            showToast('Connected! Loading today\'s data...', 'success');
-            fetchStatus();
-            fetchThresholdsFromSheet();
-            startLiveRefresh();
             const todayIso = new Date().toISOString().split('T')[0];
             ['chartDayPicker','aiDayPicker'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.max = todayIso;
             });
-            // First load: only fetch today (fast, Sheet 1 only)
-            preloadTodayData();
+            // Step 1: Fetch live status IMMEDIATELY (fast — just reads Status Sheet)
+            // This shows dryer online/offline cards within ~1-2s
+            fetchStatusTimeout(); // fire and forget — sets gapThresholdSec
+            fetchStatus();        // shows live dryer cards fast
+            fetchThresholdsFromSheet(); // fire and forget
+            startLiveRefresh();
+            showToast('Connected! Loading data in background...', 'success');
+            // Step 2: Load today's chart data in background (no overlay — silent)
+            setTimeout(() => preloadTodayData(), 200);
         }
 
-        // ===== INITIAL 24H PRELOAD =====
+        // ===== INITIAL PRELOAD =====
         let _preload24hDone = false;
 
         function setInitProgress(pct, statusText) {
@@ -4617,41 +4615,6 @@ function addGapThresholdSlider() {
             if (st && statusText) st.textContent = statusText;
         }
 
-        function startInitQuoteRotation() {
-            const icons = ['🌡️','⚡','📊','⚙️','💡','🎯','🚀','🔬'];
-            function showQ() {
-                if (!document.getElementById('initLoadOverlay') ||
-                    document.getElementById('initLoadOverlay').style.display === 'none') return;
-                const q = quotes[Math.floor(Math.random() * quotes.length)];
-                const icon = icons[Math.floor(Math.random() * icons.length)];
-                const el = document.getElementById('initQuoteIcon');
-                const et = document.getElementById('initQuoteText');
-                const ea = document.getElementById('initQuoteAuthor');
-                // Fade out
-                if (el) el.style.opacity = '0';
-                if (et) et.style.opacity = '0';
-                if (ea) ea.style.opacity = '0';
-                // Swap content after fade-out completes, then fade in
-                setTimeout(() => {
-                    if (el) el.textContent = icon;
-                    if (et) et.textContent = '"' + q.text + '"';
-                    if (ea) ea.textContent = '— ' + q.author;
-                    // Double rAF: first frame registers the new content at opacity 0,
-                    // second frame triggers the CSS transition to opacity 1
-                    requestAnimationFrame(() => requestAnimationFrame(() => {
-                        if (el) el.style.opacity = '1';
-                        if (et) et.style.opacity = '1';
-                        if (ea) ea.style.opacity = '1';
-                    }));
-                }, 520);
-            }
-            showQ();
-            return setInterval(showQ, 4500);
-        }
-
-        // Alias kept so any other code referencing preload24hData still works
-        async function preload24hData() { return preloadTodayData(); }
-
         // Tracks background preload state
         let _bgPreloadDone = false;
         let _bgPreloadRunning = false;
@@ -4659,17 +4622,14 @@ function addGapThresholdSlider() {
         async function preloadTodayData() {
             if (_preload24hDone) return;
             _preload24hDone = true;
-            const overlay = document.getElementById('initLoadOverlay');
-            if (overlay) overlay.style.display = 'flex';
-            const qTimer = startInitQuoteRotation();
+            // NO full-screen overlay — just a small background status pill
+            _showBgStatus('⏳ Loading today\'s data…');
             try {
-                setInitProgress(10, 'FETCHING TODAY\'S DATA...');
                 const now = new Date();
-                // TODAY only: midnight → now (Sheet 1 only, fast)
                 const from = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
                 const url = sheetUrl + '?start=' + encodeURIComponent(formatTimestamp(from)) + '&end=' + encodeURIComponent(formatTimestamp(now));
-                let resp = await fetchWithRetry(url);
-                let data = await resp.json();
+                const resp = await fetchWithRetry(url);
+                const data = await resp.json();
                 if (!data.error) {
                     liveData = data.values || [];
                     liveRange = 'today';
@@ -4678,30 +4638,33 @@ function addGapThresholdSlider() {
                     });
                     if (data.thresholds) { thresholdData = data.thresholds; syncThresholdInputs(); }
                     seedMiniChartsFrom24h(liveData);
+                    // If user is already on chart tab, render it silently
+                    if (currentLiveTab === 'chart') {
+                        try { renderLiveChart(); } catch(e) {}
+                        try { buildStatsTable(); } catch(e) {}
+                        try { buildLiveBarCharts(); } catch(e) {}
+                    }
+                    _showBgStatus('✓ Data ready', true);
                 }
-
-                setInitProgress(70, 'RENDERING LIVE VIEW...');
-                await new Promise(r => setTimeout(r, 80));
-
-                if (liveData && liveData.length > 1) {
-                    try { renderLiveChart(); } catch(e) {}
-                }
-
-                setInitProgress(100, '✓ LIVE — Loading rest in background...');
-                await new Promise(r => setTimeout(r, 400));
-                showToast('Live ready — loading other sections in background…', 'info');
             } catch(e) {
                 console.warn('Preload error:', e);
-                showToast('Connected — background sync starting', 'info');
             } finally {
-                clearInterval(qTimer);
-                if (overlay) overlay.style.display = 'none';
-                // Kick off background preload after overlay is gone
-                setTimeout(() => backgroundPreload(), 300);
+                // Kick off full background preload
+                setTimeout(() => backgroundPreload(), 500);
             }
         }
 
-        // ===== BACKGROUND PRELOAD =====
+        // Alias kept for backward compat
+        async function preload24hData() { return preloadTodayData(); }
+
+        function setInitProgress(pct, statusText) {
+            const bar = document.getElementById('initProgressBar');
+            const pctEl = document.getElementById('initProgressPct');
+            const st = document.getElementById('initLoadStatus');
+            if (bar) bar.style.width = pct + '%';
+            if (pctEl) pctEl.textContent = pct + '%';
+            if (st && statusText) st.textContent = statusText;
+        }
         // Silently fetches alerts, availability, stats & seeds AI tab data
         // so all sections are ready when the user navigates to them.
         async function backgroundPreload() {
@@ -9157,46 +9120,23 @@ function displayQuote(text, author, icon) {
                 alertCtx].join('\n');
         }
 
-        // groqNotify: shows a status message in chat AND/OR the flipbook loading area
+        // groqNotify: silent — only logs to console, no chat messages for API switching
         function groqNotify(html, isFlipbook) {
-            // Always show in chat
-            addChatMessage(html, 'thinking');
-            // Also update flipbook loading text if relevant
-            if (isFlipbook) {
-                const loadingEl = document.getElementById('aiInsightsLoading');
-                if (loadingEl && loadingEl.style.display !== 'none') {
-                    let notifEl = document.getElementById('groqFlipNotif');
-                    if (!notifEl) {
-                        notifEl = document.createElement('div');
-                        notifEl.id = 'groqFlipNotif';
-                        notifEl.style.cssText = 'font-size:0.72em;color:#ffcc00;letter-spacing:1px;text-align:center;padding:4px 10px;animation:pulse 1s infinite;';
-                        loadingEl.appendChild(notifEl);
-                    }
-                    notifEl.innerHTML = html;
-                }
-            }
+            console.log('[Groq]', html.replace(/<[^>]+>/g, ''));
         }
 
-        // Extract retry-after seconds from Groq rate-limit error message
-        function parseGroqRetryAfter(msg) {
-            const m = msg && msg.match(/try again in ([\d.]+)s/i);
-            return m ? parseFloat(m[1]) : null;
-        }
-
-        // callGroq with full key-rotation, user notifications, and countdown
+        // callGroq with instant key-rotation, fully silent
         async function callGroq(userMessage, systemPrompt, historyArr, isFlipbook) {
             if (GROQ_API_KEYS.length === 0) {
                 await fetchGroqKeys();
             }
             if (GROQ_API_KEYS.length === 0) {
-                throw new Error('No Groq API keys found. Please ensure they are added to the "APIs" sheet.');
+                throw new Error('No API keys found. Please add them to the APIs sheet column A.');
             }
             const messages = [{role:'system',content:systemPrompt}, ...(historyArr||[]), {role:'user',content:userMessage}];
             const totalKeys = GROQ_API_KEYS.length;
-            let startKeyIndex = groqKeyIndex;
 
             for (let attempt = 0; attempt < totalKeys; attempt++) {
-                const keyNum = groqKeyIndex + 1;
                 const key = getGroqKey();
                 try {
                     const resp = await fetch(GROQ_ENDPOINT, {
@@ -9206,94 +9146,30 @@ function displayQuote(text, author, icon) {
                     });
 
                     if (resp.status === 429 || resp.status === 413) {
-                        const errBody = await resp.json().catch(() => ({}));
-                        const errMsg  = (errBody.error || {}).message || '';
-                        const retryAfter = parseGroqRetryAfter(errMsg);
-
-                        // Build notification message
-                        let notifHtml = `⚠️ <strong>API Key ${keyNum}/${totalKeys} limit reached.</strong>`;
-                        if (retryAfter) {
-                            notifHtml += ` (retry in ${retryAfter.toFixed(1)}s)`;
-                        }
-
+                        // Rate limited — rotate to next key immediately, no wait
                         rotateGroqKey();
-                        const nextKeyNum = groqKeyIndex + 1;
-
-                        if (attempt < totalKeys - 1) {
-                            notifHtml += ` → <strong style="color:#00ffcc;">Switching to API key ${nextKeyNum}/${totalKeys}...</strong>`;
-                            groqNotify(notifHtml, isFlipbook);
-
-                            // If Groq tells us to wait, honor it (but cap at 15s so UX doesn't freeze forever)
-                            if (retryAfter && retryAfter > 0) {
-                                const waitMs = Math.min(retryAfter * 1000, 15000);
-                                await groqCountdown(retryAfter, waitMs, isFlipbook);
-                            }
-                            continue;
-                        } else {
-                            notifHtml += ` All ${totalKeys} API keys are currently rate-limited.`;
-                            groqNotify(notifHtml, isFlipbook);
-                            throw new Error('All Groq API keys are rate-limited. Please wait a moment and try again.');
-                        }
+                        console.log('[Groq] Key', attempt+1, 'rate-limited, rotating to key', groqKeyIndex+1);
+                        continue;
                     }
 
                     if (!resp.ok) {
                         const e = await resp.json().catch(() => ({}));
-                        throw new Error(((e.error || {}).message) || 'Groq error ' + resp.status);
+                        throw new Error(((e.error || {}).message) || 'Error ' + resp.status);
                     }
 
                     const d = await resp.json();
                     return ((d.choices || [])[0] || {}).message?.content || '';
 
                 } catch (err) {
-                    // Catch network/other errors that contain rate-limit language
                     if (err.message && (err.message.toLowerCase().includes('rate') || err.message.toLowerCase().includes('quota') || err.message.toLowerCase().includes('limit'))) {
-                        const retryAfter = parseGroqRetryAfter(err.message);
-                        let notifHtml = `⚠️ <strong>API Key ${keyNum}/${totalKeys} limit reached.</strong>`;
-                        if (retryAfter) notifHtml += ` (retry in ${retryAfter.toFixed(1)}s)`;
                         rotateGroqKey();
-                        const nextKeyNum = groqKeyIndex + 1;
-                        if (attempt < totalKeys - 1) {
-                            notifHtml += ` → <strong style="color:#00ffcc;">Switching to API key ${nextKeyNum}/${totalKeys}...</strong>`;
-                            groqNotify(notifHtml, isFlipbook);
-                            if (retryAfter && retryAfter > 0) {
-                                const waitMs = Math.min(retryAfter * 1000, 15000);
-                                await groqCountdown(retryAfter, waitMs, isFlipbook);
-                            }
-                            continue;
-                        }
+                        console.log('[Groq] Key', attempt+1, 'quota hit, rotating instantly');
+                        continue;
                     }
                     throw err;
                 }
             }
-            throw new Error('All Groq API keys exhausted. Please wait a moment and try again.');
-        }
-
-        // Countdown timer shown in chat while waiting for a rate-limited key's cooldown
-        async function groqCountdown(totalSecs, waitMs, isFlipbook) {
-            const countId = addChatMessage('', 'thinking');
-            const startTime = Date.now();
-            const endTime = startTime + waitMs;
-
-            return new Promise(resolve => {
-                const tick = () => {
-                    const remaining = Math.max(0, (endTime - Date.now()) / 1000);
-                    const el = document.getElementById(countId);
-                    if (el) {
-                        el.innerHTML = `⏳ Waiting <strong style="color:#ffcc00;">${remaining.toFixed(1)}s</strong> before retrying with next key...`;
-                    }
-                    if (isFlipbook) {
-                        let notifEl = document.getElementById('groqFlipNotif');
-                        if (notifEl) notifEl.innerHTML = `⏳ Waiting ${remaining.toFixed(1)}s...`;
-                    }
-                    if (remaining > 0) {
-                        setTimeout(tick, 100);
-                    } else {
-                        removeChatMessage(countId);
-                        resolve();
-                    }
-                };
-                tick();
-            });
+            throw new Error('All API keys are currently rate-limited. Please try again in a moment.');
         }
 
         async function sendAiChat() {
