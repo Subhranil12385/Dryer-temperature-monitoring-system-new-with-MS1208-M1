@@ -2817,7 +2817,7 @@ input[type="date"]::-webkit-calendar-picker-indicator {
                         <span class="urange-picker-sep">→</span>
                         <label>TO DATE<input type="date" id="liveEndDate"></label>
                         <label>TO TIME<input type="time" id="liveEndTime" value="23:59"></label>
-                        <button class="btn primary" onclick="fetchChartData()" style="font-size:0.78em;padding:6px 14px;">⟳ FETCH</button>
+                        <button class="btn primary" onclick="liveRange='custom';fetchChartData()" style="font-size:0.78em;padding:6px 14px;">⟳ FETCH</button>
                     </div>
                     <div class="controls-row" style="margin-top:4px;">
                         <button class="btn success" onclick="exportChartCSV()">⬇ CSV</button>
@@ -4572,6 +4572,8 @@ function addGapThresholdSlider() {
             if (toEl   && !toEl.value)   toEl.value   = today;
             panel.classList.add('open');
             btn.classList.add('active');
+            // Set the section range to 'custom' so FETCH picks the right branch
+            if (section === 'chart') liveRange = 'custom';
             // Deactivate other range buttons
             const barId = { chart: 'chartRangeBar', alert: 'alertRangeBar', mcu: 'mcuRangeBar', dryer: 'dryerRangeBar' }[section];
             document.querySelectorAll('#' + barId + ' .urange-btn:not(.custom-btn)').forEach(b => b.classList.remove('active'));
