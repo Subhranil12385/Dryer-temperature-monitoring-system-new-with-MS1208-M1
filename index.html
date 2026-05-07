@@ -3047,6 +3047,40 @@ input[type="date"]::-webkit-calendar-picker-indicator {
                             📋 HISTORICAL VIOLATIONS — select date range and click FETCH HISTORY
                         </div>
 
+                        <!-- Relaxation filters -->
+                        <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px;background:rgba(0,20,50,0.6);border:1px solid rgba(0,255,204,0.15);border-radius:7px;padding:10px 14px;">
+                            <div>
+                                <div style="font-size:0.72em;color:rgba(0,255,204,0.6);margin-bottom:4px;letter-spacing:1px;">RELAXATION DURATION (min)</div>
+                                <input type="number" id="ahRelaxMin" value="0" min="0" max="60" step="1"
+                                    oninput="applyAlertHistoryFilters()"
+                                    style="width:90px;background:rgba(0,30,60,0.9);border:1px solid rgba(0,255,204,0.3);color:#00ffcc;padding:6px 10px;border-radius:5px;font-family:'Share Tech Mono',monospace;font-size:0.85em;">
+                                <div style="font-size:0.65em;color:rgba(0,255,204,0.4);margin-top:2px;">Skip events shorter than this</div>
+                            </div>
+                            <div>
+                                <div style="font-size:0.72em;color:rgba(0,255,204,0.6);margin-bottom:4px;letter-spacing:1px;">RELAXATION DEGREE (°C)</div>
+                                <input type="number" id="ahRelaxDeg" value="0" min="0" max="50" step="0.5"
+                                    oninput="applyAlertHistoryFilters()"
+                                    style="width:90px;background:rgba(0,30,60,0.9);border:1px solid rgba(0,255,204,0.3);color:#00ffcc;padding:6px 10px;border-radius:5px;font-family:'Share Tech Mono',monospace;font-size:0.85em;">
+                                <div style="font-size:0.65em;color:rgba(0,255,204,0.4);margin-top:2px;">Skip events with Over By less than this</div>
+                            </div>
+                            <div id="ahFilterCount" style="font-size:0.75em;color:rgba(0,255,204,0.5);align-self:center;"></div>
+                        </div>
+                        <!-- Dryer / Chamber toggle filters -->
+                        <div style="margin-bottom:14px;background:rgba(0,20,50,0.6);border:1px solid rgba(0,255,204,0.15);border-radius:7px;padding:10px 14px;">
+                            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                                <div>
+                                    <div style="font-size:0.72em;color:rgba(0,255,204,0.6);margin-bottom:5px;letter-spacing:1px;">DRYER</div>
+                                    <div id="ahDryerBtns" style="display:flex;gap:5px;flex-wrap:wrap;"></div>
+                                </div>
+                                <div style="width:1px;height:40px;background:rgba(0,255,204,0.15);margin:0 4px;"></div>
+                                <div>
+                                    <div style="font-size:0.72em;color:rgba(0,255,204,0.6);margin-bottom:5px;letter-spacing:1px;">CHAMBER</div>
+                                    <div id="ahChamberBtns" style="display:flex;gap:5px;flex-wrap:wrap;"></div>
+                                </div>
+                                <button onclick="ahResetDryerChamber()" style="margin-left:auto;align-self:flex-end;background:rgba(0,30,60,0.8);border:1px solid rgba(0,255,204,0.25);color:rgba(0,255,204,0.6);padding:5px 10px;border-radius:5px;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:0.72em;">RESET</button>
+                            </div>
+                        </div>
+
                         <!-- Summary chips -->
                         <div id="alertSummaryChips" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;"></div>
 
@@ -4401,7 +4435,7 @@ function addGapThresholdSlider() {
         if (btn) btn.classList.toggle('active', t === tab);
     });
     currentLiveTab = tab;
-    if (tab === 'alerts') refreshActiveAlerts();
+    if (tab === 'alerts') { refreshActiveAlerts(); initAlertHistoryFilterBtns(); }
     if (tab === 'threshold') {
         if (!_threshUnlocked) {
             document.getElementById('threshPwGate').style.display = 'block';
@@ -4685,7 +4719,7 @@ function addGapThresholdSlider() {
                     if (!ad.error) {
                         alertHistoryData = ad.alerts || [];
                         alertRange = 'today';
-                        try { renderAlertHistory(alertHistoryData); } catch(e) {}
+                        try { applyAlertHistoryFilters(); } catch(e) {}
                     }
                 } catch(e) { console.warn('[BG] Alert preload:', e); }
 
@@ -6109,7 +6143,7 @@ const pts = buildGappedDataset(rows, colIdx, gapMs);
                 const data = await resp.json();
                 if (data.error) throw new Error(data.error);
                 alertHistoryData = data.alerts || [];
-                renderAlertHistory(alertHistoryData);
+                applyAlertHistoryFilters();
             } catch(e) {
                 showToast('Alert fetch error: ' + e.message, 'error');
             } finally {
@@ -6135,7 +6169,7 @@ const pts = buildGappedDataset(rows, colIdx, gapMs);
                 const data = await resp.json();
                 if (data.error) throw new Error(data.error);
                 alertHistoryData = data.alerts || [];
-                renderAlertHistory(alertHistoryData);
+                applyAlertHistoryFilters();
             } catch(e) {
                 showToast('Alert fetch error: ' + e.message, 'error');
             } finally {
@@ -6195,6 +6229,81 @@ const pts = buildGappedDataset(rows, colIdx, gapMs);
                 const inp = document.getElementById('alertRemark_' + idx);
                 if (inp) inp.value = a.remarks || '';
             });
+        }
+
+        // Track selected dryers/chambers for alert history filter (null = all selected)
+        let _ahDryers = null;   // Set of selected dryer numbers, or null = all
+        let _ahChambers = null; // Set of selected chamber numbers, or null = all
+
+        function initAlertHistoryFilterBtns() {
+            const dryerWrap = document.getElementById('ahDryerBtns');
+            const chamberWrap = document.getElementById('ahChamberBtns');
+            if (!dryerWrap || !chamberWrap) return;
+            dryerWrap.innerHTML = '';
+            chamberWrap.innerHTML = '';
+            for (let d = 1; d <= NUM_DRYERS; d++) {
+                const b = document.createElement('button');
+                b.textContent = 'D' + d;
+                b.dataset.d = d;
+                b.className = 'ah-filter-btn ah-dryer-btn active';
+                b.onclick = () => { b.classList.toggle('active'); _syncAhSet('dryer'); applyAlertHistoryFilters(); };
+                b.style.cssText = 'background:rgba(0,30,60,0.8);border:1px solid rgba(0,255,204,0.3);color:rgba(0,255,204,0.7);padding:4px 10px;border-radius:5px;cursor:pointer;font-family:\'Share Tech Mono\',monospace;font-size:0.8em;transition:all 0.15s;';
+                dryerWrap.appendChild(b);
+            }
+            for (let c = 1; c <= NUM_CHAMBERS; c++) {
+                const b = document.createElement('button');
+                b.textContent = 'C' + c;
+                b.dataset.c = c;
+                b.className = 'ah-filter-btn ah-chamber-btn active';
+                b.onclick = () => { b.classList.toggle('active'); _syncAhSet('chamber'); applyAlertHistoryFilters(); };
+                b.style.cssText = 'background:rgba(0,30,60,0.8);border:1px solid rgba(0,255,204,0.3);color:rgba(0,255,204,0.7);padding:4px 10px;border-radius:5px;cursor:pointer;font-family:\'Share Tech Mono\',monospace;font-size:0.8em;transition:all 0.15s;';
+                chamberWrap.appendChild(b);
+            }
+            _addAhBtnStyle();
+        }
+
+        function _addAhBtnStyle() {
+            if (document.getElementById('ahBtnStyle')) return;
+            const s = document.createElement('style');
+            s.id = 'ahBtnStyle';
+            s.textContent = '.ah-filter-btn.active{background:rgba(0,80,130,0.9)!important;color:#00ffcc!important;border-color:#00ffcc!important;}';
+            document.head.appendChild(s);
+        }
+
+        function _syncAhSet(type) {
+            if (type === 'dryer') {
+                const active = [...document.querySelectorAll('.ah-dryer-btn.active')].map(b => +b.dataset.d);
+                _ahDryers = active.length === NUM_DRYERS ? null : new Set(active);
+            } else {
+                const active = [...document.querySelectorAll('.ah-chamber-btn.active')].map(b => +b.dataset.c);
+                _ahChambers = active.length === NUM_CHAMBERS ? null : new Set(active);
+            }
+        }
+
+        function ahResetDryerChamber() {
+            _ahDryers = null; _ahChambers = null;
+            document.querySelectorAll('.ah-dryer-btn,.ah-chamber-btn').forEach(b => b.classList.add('active'));
+            applyAlertHistoryFilters();
+        }
+
+        function applyAlertHistoryFilters() {
+            const relaxMin = parseFloat(document.getElementById('ahRelaxMin').value) || 0;
+            const relaxDeg = parseFloat(document.getElementById('ahRelaxDeg').value) || 0;
+            const filtered = (alertHistoryData || []).filter(a => {
+                if (relaxMin > 0 && (a.durationSeconds || 0) < relaxMin * 60) return false;
+                if (relaxDeg > 0 && (a.peakTemp - a.threshold) < relaxDeg) return false;
+                if (_ahDryers && !_ahDryers.has(a.dryer)) return false;
+                if (_ahChambers && !_ahChambers.has(a.chamber)) return false;
+                return true;
+            });
+            const countEl = document.getElementById('ahFilterCount');
+            if (countEl) {
+                const hidden = (alertHistoryData || []).length - filtered.length;
+                countEl.textContent = hidden > 0
+                    ? `Showing ${filtered.length} of ${alertHistoryData.length} (${hidden} filtered)`
+                    : `Showing all ${filtered.length} events`;
+            }
+            renderAlertHistory(filtered);
         }
 
         function formatDuration(seconds) {
