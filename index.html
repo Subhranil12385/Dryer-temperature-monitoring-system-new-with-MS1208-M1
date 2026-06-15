@@ -844,7 +844,9 @@
         body.light-mode .mode-btn:hover:not(.active) { color: #1565C0; }
 
         /* Home screen text */
-        body.light-mode #homeScreen *            { color: #0d1b2a; }
+        body.light-mode #homeScreen *:not(.btn)  { color: #0d1b2a; }
+        body.light-mode #homeScreen .btn.primary { color: #e0f2fe !important; } /* Light blue */
+        body.light-mode #homeScreen .btn.orange  { color: #FFFFFF !important; } /* White */
         body.light-mode #homeScreen .mode-btn.active { color: #FFFFFF; }
         body.light-mode #homeScreen .logo        { color: #FFFFFF; }
 
@@ -2303,7 +2305,7 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 
         .toggle-switch {
             position: relative;
-            width: 50px;
+            width: 70px;
             height: 24px;
             cursor: pointer;
         }
@@ -2345,7 +2347,7 @@ input[type="date"]::-webkit-calendar-picker-indicator {
         }
 
         .toggle-switch input:checked + .toggle-slider:before {
-            transform: translateX(26px);
+            transform: translateX(46px);
             background: #0ff;
             box-shadow: 0 0 10px #0ff;
         }
@@ -3463,6 +3465,118 @@ input[type="date"]::-webkit-calendar-picker-indicator {
             outline: none;
             box-shadow: 0 0 10px currentColor;
         }
+
+        /* Veneer dashboard theme overrides */
+        #veneerTitle {
+            color: #00ffcc;
+        }
+        body.light-mode #veneerTitle {
+            color: #1565C0;
+        }
+        #veneerMoistureVal {
+            color: #ffffff;
+        }
+        body.light-mode #veneerMoistureVal {
+            color: #0d1b2a;
+        }
+        #veneerTempVal {
+            color: rgba(255, 255, 255, 0.4);
+        }
+        body.light-mode #veneerTempVal {
+            color: rgba(13, 27, 42, 0.4);
+        }
+        #veneerLastSeen {
+            color: #aaa;
+        }
+        body.light-mode #veneerLastSeen {
+            color: #718096;
+        }
+        #veneerRawTempVal {
+            color: #888;
+        }
+        body.light-mode #veneerRawTempVal {
+            color: #4a5568;
+        }
+
+        /* Calibration Settings Styles */
+        .cal-sub-panel {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 15px;
+            transition: all 0.3s ease;
+        }
+        body.light-mode .cal-sub-panel {
+            background: #F7FAFC;
+            border-color: #E2E8F0;
+        }
+        .cal-input {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            color: #ffffff;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 1.0em;
+            outline: none;
+            box-sizing: border-box;
+            transition: border-color 0.2s ease;
+        }
+        .cal-input:focus {
+            border-color: #00ffcc;
+        }
+        body.light-mode .cal-input {
+            background: #ffffff;
+            border-color: #CBD5E0;
+            color: #0d1b2a;
+        }
+        body.light-mode .cal-input:focus {
+            border-color: #1565C0;
+        }
+        .cal-eq-container {
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 6px;
+            padding: 10px 15px;
+            margin-bottom: 20px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 0.95em;
+            border-left: 3px solid #ffaa44;
+            color: #ffffff;
+        }
+        body.light-mode .cal-eq-container {
+            background: #EDF2F7;
+            border-color: #1565C0;
+            color: #2D3748;
+        }
+        body.light-mode .cal-eq-container span {
+            color: #1565C0 !important;
+        }
+        .cal-del-btn {
+            background: transparent;
+            border: none;
+            color: #ff4444;
+            cursor: pointer;
+            font-size: 1.1em;
+            padding: 4px 8px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        .cal-del-btn:hover {
+            background: rgba(255, 68, 68, 0.15);
+        }
+        body.light-mode .cal-del-btn {
+            color: #c62828;
+        }
+        body.light-mode .cal-del-btn:hover {
+            background: rgba(198, 40, 40, 0.1);
+        }
+        body.light-mode #calibrationFitInfo {
+            color: #4A5568 !important;
+        }
+        body.light-mode #calibrationFitInfo span {
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
@@ -3519,15 +3633,16 @@ input[type="date"]::-webkit-calendar-picker-indicator {
                     <span id="themeIcon">☀️</span>
                     <span id="themeLabel">LIGHT</span>
                 </button>
-                <button class="btn" onclick="goHome()">🏠 HOME</button>
+                <button class="btn" onclick="goHome()" ondblclick="toggleCsvAnalyticsVisibility()">🏠 HOME</button>
                 <button class="btn success" id="refreshBtn" onclick="manualRefresh()" style="display: none;">⟳ REFRESH</button>
             </div>
         </header>
 
         <!-- MODE SELECTOR -->
         <div class="mode-selector">
-            <button class="mode-btn active" onclick="switchMode('online')" id="modeOnlineBtn">📡 ONLINE MONITORING</button>
-            <button class="mode-btn" onclick="switchMode('csv')" id="modeCsvBtn">📂 CSV ANALYTICS</button>
+            <button class="mode-btn active" onclick="switchMode('online')" id="modeOnlineBtn">🏭DRYER CHAMBER-WISE TEMPERATURE</button>
+            <button class="mode-btn" onclick="switchMode('csv')" id="modeCsvBtn" style="display: none;">📂 CSV ANALYTICS</button>
+            <button class="mode-btn" onclick="switchMode('veneer')" id="modeVeneerBtn">📜VENEER MOISTURE & TEMPERATURE</button>
         </div>
 
         <!-- HOME SCREEN (shown initially) -->
@@ -3536,8 +3651,10 @@ input[type="date"]::-webkit-calendar-picker-indicator {
                 <div style="font-size: 3em; margin-bottom: 20px; animation: pulse 2s infinite;">⚡</div>
                 <div class="home-card-title" style="font-size: 1.5em; margin-bottom: 20px;">SELECT A MODE TO BEGIN</div>
                 <div style="display: flex; gap: 20px; justify-content: center; flex-wrap: wrap;">
-                    <button class="btn primary" onclick="switchMode('online')" style="font-size: 1.2em; padding: 15px 30px;">📡 ONLINE MONITORING</button>
-                    <button class="btn orange" onclick="switchMode('csv')" style="font-size: 1.2em; padding: 15px 30px;">📂 CSV ANALYTICS</button>
+                    <button class="btn primary" onclick="switchMode('online')" style="font-size: 1.2em; padding: 15px 30px;">🏭♨️ CHAMBER-WISE TEMPERATURES</button>
+                    <button class="btn orange" onclick="switchMode('csv')" id="homeCsvBtn" style="font-size: 1.2em; padding: 15px 30px; display: none;">📂 CSV ANALYTICS</button>
+                    <button class="btn" onclick="switchMode('veneer')" style="font-size: 1.2em; padding: 15px 30px; background: linear-gradient(135deg, #1b5e20, #2e7d32); border: 2px solid #4caf50; color: #a5d6a7; box-shadow: 0 0 20px rgba(76,175,80,0.4);">🪵📜💧🌡️ VENEER MOISTURE & TEMPERATURE
+</button>
                 </div>
             </div>
         </div>
@@ -4609,6 +4726,153 @@ Responses generated by AI may not always be accurate; please do not rely on them
             </div><!-- end tabReport -->
 
         </div>  <!-- END onlineScreen -->
+
+        <!-- VENEER MOISTURE & TEMPERATURE MONITORING SCREEN -->
+        <div id="veneerScreen" style="display: none;">
+            <div class="panel" style="margin-top: 20px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px;">
+                    <div>
+                        <h2 id="veneerTitle" style="margin: 0; font-family: 'Share Tech Mono', monospace; font-size: 1.8em; letter-spacing: 2px;">🪵 VENEER MOISTURE & TEMPERATURE</h2>
+                        <div style="color: #888; font-size: 0.9em; margin-top: 5px;">Live & Historical Telemetry from Veneer Monitor</div>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+                        <!-- Booster Resistor Switch -->
+                        <div style="display: flex; flex-direction: column; align-items: flex-end; margin-right: 15px;">
+                            <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 0.85em; font-family: 'Share Tech Mono', monospace; color: var(--text-muted, #aaa);">
+                                ⚡ Range Booster Resistor
+                                <div class="toggle-switch">
+                                    <input type="checkbox" id="resistorSwitch" onchange="toggleVeneerResistor(this)">
+                                    <span class="toggle-slider"></span>
+                                </div>
+                            </label>
+                            <span style="font-size: 0.7em; color: #ffaa44; margin-top: 3px; max-width: 250px; text-align: right; line-height: 1.2;">
+                                * Enabling booster resistor increases range but may reduce accuracy. Sudden spike may happen after clicking the box
+                            </span>
+                        </div>
+                        <div id="veneerStatusBadge" class="status-badge unknown" style="font-size: 1.0em; padding: 6px 16px; border-radius: 20px; font-weight: bold; letter-spacing: 1px;">UNKNOWN</div>
+                        <div id="veneerLastSeen" style="font-family: 'Share Tech Mono', monospace; font-size: 0.9em;">Last seen: --</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dashboard Grid -->
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-top: 20px;">
+                <!-- Moisture Live Card -->
+                <div class="panel" style="text-align: center; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 250px; position: relative; overflow: hidden; border: 1px solid rgba(0, 255, 204, 0.2);">
+                    <div style="font-size: 1em; color: #00ffcc; letter-spacing: 1.5px; font-family: 'Share Tech Mono', monospace; margin-bottom: 15px;">LIVE MOISTURE</div>
+                    <div id="veneerMoistureVal" style="font-size: 4.5em; font-weight: bold; font-family: 'Share Tech Mono', monospace; text-shadow: 0 0 20px rgba(255,255,255,0.15);">--.-%</div>
+                    <div id="veneerAdcVal" style="font-size: 1.1em; color: #888; margin-top: 10px; font-family: 'Share Tech Mono', monospace;">Raw ADC: --</div>
+                    <div style="position: absolute; bottom: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, transparent, #00ffcc, transparent);"></div>
+                </div>
+
+                <!-- Temperature Live Card (Future Scope) -->
+                <div class="panel" style="text-align: center; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 250px; position: relative; overflow: hidden; border: 1px solid rgba(255, 170, 68, 0.2);">
+                    <div style="font-size: 1em; color: #ffaa44; letter-spacing: 1.5px; font-family: 'Share Tech Mono', monospace; margin-bottom: 15px;">TEMPERATURE (FUTURE SCOPE)</div>
+                    <div id="veneerTempVal" style="font-size: 4em; font-weight: bold; font-family: 'Share Tech Mono', monospace;">--.-°C</div>
+                    <div id="veneerRawTempVal" style="font-size: 1.1em; margin-top: 10px; font-family: 'Share Tech Mono', monospace;">Raw Temp: --</div>
+                    <div style="font-size: 0.8em; color: #ffaa44; opacity: 0.6; margin-top: 15px; font-family: 'Share Tech Mono', monospace; max-width: 220px; border: 1px dashed rgba(255, 170, 68, 0.4); padding: 4px 8px; border-radius: 4px;">⚠️ Sensor probe not connected</div>
+                    <div style="position: absolute; bottom: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, transparent, #ffaa44, transparent);"></div>
+                </div>
+            </div>
+
+            <!-- Historical Chart Section -->
+            <div class="panel" style="margin-top: 20px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px; margin-bottom: 15px;">
+                    <div class="panel-title" style="margin: 0;">📉 VENEER HISTORICAL TRENDS</div>
+                    <!-- Range Selector Bar -->
+                    <div class="urange-bar" id="veneerRangeBar">
+                        <button class="urange-btn active" data-range="today" onclick="setVeneerRange('today', this)" style="color:#00ff88;border-color:rgba(0,255,136,0.5);">📅 TODAY</button>
+                        <div class="urange-sep"></div>
+                        <button class="urange-btn" data-range="1h" onclick="setVeneerRange('1h', this)">1H</button>
+                        <button class="urange-btn" data-range="6h" onclick="setVeneerRange('6h', this)">6H</button>
+                        <button class="urange-btn" data-range="12h" onclick="setVeneerRange('12h', this)">12H</button>
+                        <button class="urange-btn" data-range="24h" onclick="setVeneerRange('24h', this)">24H</button>
+                        <div class="urange-sep"></div>
+                        <button class="urange-btn" data-range="3d" onclick="setVeneerRange('3d', this)">3D</button>
+                        <button class="urange-btn" data-range="7d" onclick="setVeneerRange('7d', this)">7D</button>
+                    </div>
+                </div>
+                <!-- Veneer Chart Canvas -->
+                <div style="position: relative; height: 350px; width: 100%;">
+                    <canvas id="veneerChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Veneer Calibration Settings Panel -->
+            <div class="panel" style="margin-top: 20px;" id="veneerCalibrationSection">
+                <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(0, 255, 204, 0.2); padding-bottom: 10px; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
+                    <h3 style="margin: 0; font-family: 'Share Tech Mono', monospace; font-size: 1.4em; color: #00ffcc; letter-spacing: 1.5px;">⚙️ CALIBRATION SETTINGS</h3>
+                    <div id="calibrationFitInfo" style="font-family: 'Share Tech Mono', monospace; font-size: 0.95em; color: #aaa;">
+                        Fit Type: <span id="fitTypeVal" style="color: #ffaa44;">--</span> | R²: <span id="fitR2Val" style="color: #00ffcc;">--</span>
+                    </div>
+                </div>
+                
+                <div class="cal-eq-container" id="fitEquationContainer">
+                    Active Equation: <span id="fitEquationText" style="color: #fff; font-weight: bold;">Loading...</span>
+                </div>
+
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px;">
+                    <!-- Without Resistor Section -->
+                    <div class="cal-sub-panel">
+                        <h4 style="margin-top: 0; margin-bottom: 12px; font-family: 'Share Tech Mono', monospace; color: #00ffcc; font-size: 1.1em; border-bottom: 1px dashed rgba(255,255,255,0.1); padding-bottom: 8px;">
+                            Without Resistor Table (J & K)
+                        </h4>
+                        <div style="overflow-x: auto;">
+                            <table style="width: 100%; border-collapse: collapse; font-family: 'Share Tech Mono', monospace; font-size: 0.9em;">
+                                <thead>
+                                    <tr style="border-bottom: 1px solid rgba(0,255,204,0.2); text-align: left;">
+                                        <th style="padding: 6px 4px; color: #888;">Analog (ADC)</th>
+                                        <th style="padding: 6px 4px; color: #888;">Moisture (%)</th>
+                                        <th style="padding: 6px 4px; text-align: center; color: #888; width: 50px;">Delete</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="withoutResistorTableBody">
+                                    <!-- Dynamic rows -->
+                                </tbody>
+                            </table>
+                        </div>
+                        <button type="button" onclick="addCalibrationRow('without')" style="margin-top: 12px; background: transparent; border: 1px dashed #00ffcc; color: #00ffcc; padding: 6px 12px; border-radius: 4px; font-family: 'Share Tech Mono', monospace; font-size: 0.85em; cursor: pointer; width: 100%; transition: all 0.2s;">
+                            + Add Calibration Point
+                        </button>
+                    </div>
+
+                    <!-- With Resistor Section -->
+                    <div class="cal-sub-panel">
+                        <h4 style="margin-top: 0; margin-bottom: 12px; font-family: 'Share Tech Mono', monospace; color: #ffaa44; font-size: 1.1em; border-bottom: 1px dashed rgba(255,255,255,0.1); padding-bottom: 8px;">
+                            With Resistor Table (M & N)
+                        </h4>
+                        <div style="overflow-x: auto;">
+                            <table style="width: 100%; border-collapse: collapse; font-family: 'Share Tech Mono', monospace; font-size: 0.9em;">
+                                <thead>
+                                    <tr style="border-bottom: 1px solid rgba(255,170,68,0.2); text-align: left;">
+                                        <th style="padding: 6px 4px; color: #888;">Analog (ADC)</th>
+                                        <th style="padding: 6px 4px; color: #888;">Moisture (%)</th>
+                                        <th style="padding: 6px 4px; text-align: center; color: #888; width: 50px;">Delete</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="withResistorTableBody">
+                                    <!-- Dynamic rows -->
+                                </tbody>
+                            </table>
+                        </div>
+                        <button type="button" onclick="addCalibrationRow('with')" style="margin-top: 12px; background: transparent; border: 1px dashed #ffaa44; color: #ffaa44; padding: 6px 12px; border-radius: 4px; font-family: 'Share Tech Mono', monospace; font-size: 0.85em; cursor: pointer; width: 100%; transition: all 0.2s;">
+                            + Add Calibration Point
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Action buttons -->
+                <div style="display: flex; justify-content: flex-end; gap: 15px; margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 15px; flex-wrap: wrap;">
+                    <button type="button" id="btnReloadCalibration" onclick="fetchVeneerCalibration()" style="background: transparent; border: 1px solid #888; color: #ccc; padding: 8px 16px; border-radius: 4px; font-family: 'Share Tech Mono', monospace; font-size: 0.9em; cursor: pointer; transition: all 0.2s;">
+                        Reload Data
+                    </button>
+                    <button type="button" id="btnSaveCalibration" onclick="saveVeneerCalibration()" style="background: linear-gradient(135deg, #00ffcc, #009977); border: none; color: #000; font-weight: bold; padding: 8px 24px; border-radius: 4px; font-family: 'Share Tech Mono', monospace; font-size: 0.9em; cursor: pointer; transition: all 0.2s; box-shadow: 0 0 15px rgba(0,255,204,0.3);">
+                        Save Calibration
+                    </button>
+                </div>
+            </div>
+        </div>
+
         <!-- CSV ANALYTICS SCREEN (same as before) -->
         <div id="csvScreen">
             <div class="csv-header">
@@ -4820,9 +5084,12 @@ Responses generated by AI may not always be accurate; please do not rely on them
         // Uses Sublynq's GAS which already has action=getDriveCsv & action=readSheet
         const SUBLYNQ_GAS_URL = 'https://script.google.com/macros/s/AKfycbwTjlAIapKrqf78dGs6za7H6pq0BpZHw15GQilcUKNq41G2t746h3ch-y4MDuPU_imr/exec';
         const DRYER_LIVE_SHEET_ID = '1yEFDyVVT45pkYLupQZR9bs4xzOawS_pxnqKB2qVYRBE';
+        const VENEER_LIVE_SHEET_ID = '12QqTI3isHwNFfqKyIERWwwGrMhvpIx8DibwWP3N5kJI';
+        const VENEER_GAS_URL = 'https://script.google.com/macros/s/AKfycbzlKfOaLTMl6JfPxBZ-xBhrBC9RDyu51wFKEPXG_bd4A5pjAWvulGuCnEzIW_uGRhk_/exec';
         const driveFolders = {
             '1-4': '1G6ZyKmXADZaOrDZ2AJhhC7HuPTC4n4xR',
-            '5-6': '17DHy6YoELh214ZfRft56sJaRg9y_GkHi'
+            '5-6': '17DHy6YoELh214ZfRft56sJaRg9y_GkHi',
+            'veneer': '1fJu7tlIeO7irGBPJ9o0ZM8vZ1D3cDdpO'
         };
         const D_DRIVE_FOLDER_2026 = driveFolders['1-4']; // legacy ref
         const D_MONTH_NAMES_FAST  = ['January','February','March','April','May','June','July','August','September','October','November','December'];
@@ -4920,6 +5187,11 @@ Responses generated by AI may not always be accurate; please do not rely on them
             if (!ts) return null;
             if (ts instanceof Date) return isNaN(ts) ? null : ts;
             const s = String(ts).trim();
+            // If the string contains ISO timezone specifiers (Z or offset), let native Date handle it.
+            if (/(?:Z|[+-]\d{2}(?::?\d{2})?)$/i.test(s)) {
+                const d = new Date(s);
+                if (!isNaN(d.getTime())) return d;
+            }
             // DD/MM/YYYY HH:MM:SS (what toLocalStr now outputs)
             let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})/);
             if (m) return new Date(+m[3],+m[2]-1,+m[1],+m[4],+m[5],+m[6]);
@@ -5274,7 +5546,7 @@ Responses generated by AI may not always be accurate; please do not rely on them
         let activeChambers = {};
         // Gap-break threshold (seconds). Fetched from Status Sheet P2 on connect.
     // Chart lines break when consecutive-point gap > this value.
-let gapThresholdSec = 120;
+let gapThresholdSec = 300;
 let forceJoinGaps   = true;  // user override: connect all points regardless of gap
 
 // Add this new function to create and manage the gap threshold slider
@@ -5301,7 +5573,7 @@ function addGapThresholdSlider() {
     sliderDiv.innerHTML = `
         <span style="color: ${isLight ? '#1565C0' : '#00ffcc'}; white-space: nowrap;">⏱️ Gap threshold:</span>
         <input type="range" id="gapThresholdSlider" 
-               min="10" max="120" value="${gapThresholdSec}" step="10"
+               min="30" max="600" value="${gapThresholdSec}" step="30"
                style="flex: 1; height: 6px; background: ${isLight ? '#E2E8F0' : 'rgba(0,255,204,0.2)'}; 
                       border-radius: 3px; -webkit-appearance: none;
                       accent-color: ${isLight ? '#1565C0' : '#00ffcc'};">
@@ -5342,6 +5614,9 @@ function addGapThresholdSlider() {
                 renderLiveChart();
             }
             showToast(`Gap threshold set to ${gapThresholdSec}s`, 'info');
+        } else if (currentMode === 'veneer') {
+            renderVeneerChart();
+            showToast(`Gap threshold set to ${gapThresholdSec}s`, 'info');
         }
     });
     
@@ -5360,6 +5635,9 @@ function addGapThresholdSlider() {
             } else {
                 renderLiveChart();
             }
+            showToast(forceJoinGaps ? 'Force join enabled' : 'Force join disabled', 'info');
+        } else if (currentMode === 'veneer') {
+            renderVeneerChart();
             showToast(forceJoinGaps ? 'Force join enabled' : 'Force join disabled', 'info');
         }
     });
@@ -5546,19 +5824,25 @@ function addGapThresholdSlider() {
             
             document.getElementById('modeOnlineBtn').classList.toggle('active', mode === 'online');
             document.getElementById('modeCsvBtn').classList.toggle('active', mode === 'csv');
+            const modeVeneerBtn = document.getElementById('modeVeneerBtn');
+            if (modeVeneerBtn) modeVeneerBtn.classList.toggle('active', mode === 'veneer');
             
             document.getElementById('homeScreen').style.display = 'none';
-            // Show online screen IMMEDIATELY — no blocking overlay on first load
             document.getElementById('onlineScreen').style.display = mode === 'online' ? 'block' : 'none';
             document.getElementById('csvScreen').style.display = mode === 'csv' ? 'block' : 'none';
+            const veneerScreen = document.getElementById('veneerScreen');
+            if (veneerScreen) veneerScreen.style.display = mode === 'veneer' ? 'block' : 'none';
             
-            document.getElementById('refreshBtn').style.display = mode === 'online' ? 'inline-block' : 'none';
+            document.getElementById('refreshBtn').style.display = (mode === 'online' || mode === 'veneer') ? 'inline-block' : 'none';
             
             if (mode === 'online') {
                 if (!isConnected) {
-                    // NO full-screen overlay on first load — UI shows immediately
-                    // connectSheet fetches status fast then does everything in background
                     setTimeout(() => connectSheet(), 50);
+                }
+                stopQuoteDisplay();
+            } else if (mode === 'veneer') {
+                if (!isVeneerConnected) {
+                    setTimeout(() => connectVeneer(), 50);
                 }
                 stopQuoteDisplay();
             } else if (mode === 'csv') {
@@ -5570,6 +5854,29 @@ function addGapThresholdSlider() {
             document.getElementById('homeScreen').style.display = 'block';
             document.getElementById('onlineScreen').style.display = 'none';
             document.getElementById('csvScreen').style.display = 'none';
+            const veneerScreen = document.getElementById('veneerScreen');
+            if (veneerScreen) veneerScreen.style.display = 'none';
+            document.getElementById('refreshBtn').style.display = 'none';
+        }
+
+        function toggleCsvAnalyticsVisibility() {
+            const modeCsvBtn = document.getElementById('modeCsvBtn');
+            const homeCsvBtn = document.getElementById('homeCsvBtn');
+            if (modeCsvBtn && homeCsvBtn) {
+                const isHidden = modeCsvBtn.style.display === 'none';
+                if (isHidden) {
+                    modeCsvBtn.style.display = '';
+                    homeCsvBtn.style.display = '';
+                    showToast('CSV Analytics mode enabled', 'success');
+                } else {
+                    modeCsvBtn.style.display = 'none';
+                    homeCsvBtn.style.display = 'none';
+                    showToast('CSV Analytics mode disabled', 'info');
+                    if (currentMode === 'csv') {
+                        goHome();
+                    }
+                }
+            }
         }
 
         // ===== ONLINE MODE FUNCTIONS =====
@@ -6307,12 +6614,15 @@ function addGapThresholdSlider() {
 
         async function fetchStatusTimeout() {
             try {
+                const filteredUrls = Object.entries(sheetUrls)
+                    .filter(([key, url]) => key !== 'veneer')
+                    .map(([key, url]) => url);
                 const results = await Promise.allSettled(
-                    Object.values(sheetUrls).map(url => fetchWithRetry(url + '?action=getStatusTimeout').then(r => r.json()))
+                    filteredUrls.map(url => fetchWithRetry(url + '?action=getStatusTimeout&t=' + Date.now()).then(r => r.json()))
                 );
                 for (const res of results) {
                     if (res.status === 'fulfilled' && res.value && res.value.timeoutSeconds >= 10) {
-                        gapThresholdSec = res.value.timeoutSeconds;
+                        gapThresholdSec = Math.max(300, res.value.timeoutSeconds);
                         console.log('[Gap] Status timeout loaded from sheet:', gapThresholdSec, 's');
                         break; // take first valid
                     }
@@ -6443,13 +6753,16 @@ function buildGappedDataset(rows, colIdx, gapThreshMs) {
             if (isConnected && currentMode === 'online') { 
                 fetchStatus(); 
                 fetchThresholdsFromSheet(); 
+            } else if (isVeneerConnected && currentMode === 'veneer') {
+                fetchVeneerStatus();
             }
         }
 
         async function fetchStatus() {
             try {
+                const filteredEntries = Object.entries(sheetUrls).filter(([key, url]) => key !== 'veneer');
                 const results = await Promise.allSettled(
-                    Object.entries(sheetUrls).map(([key, url]) => fetchWithRetry(url + '?action=getStatus').then(r => r.json()))
+                    filteredEntries.map(([key, url]) => fetchWithRetry(url + '?action=getStatus&t=' + Date.now()).then(r => r.json()))
                 );
                 let mergedStatusInfo = {};
                 let success = false;
@@ -6460,6 +6773,22 @@ function buildGappedDataset(rows, colIdx, gapThreshMs) {
                     }
                 }
                 if (success) {
+                    // Enforce client-side offline check override (5 minutes = 300 seconds)
+                    for (const key in mergedStatusInfo) {
+                        const lastSeenStr = mergedStatusInfo[key].lastSeen;
+                        if (lastSeenStr && lastSeenStr !== '--') {
+                            const lastSeenDate = parseTs(lastSeenStr);
+                            if (lastSeenDate && !isNaN(lastSeenDate.getTime())) {
+                                const diffSec = (new Date() - lastSeenDate) / 1000;
+                                if (diffSec <= 300) {
+                                    mergedStatusInfo[key].status = 'ONLINE';
+                                } else {
+                                    mergedStatusInfo[key].status = 'OFFLINE';
+                                }
+                            }
+                        }
+                    }
+                    
                     statusData = mergedStatusInfo;
                     updateStatusCards(statusData);
                     recordLiveMiniHistory(statusData);
@@ -11096,6 +11425,11 @@ ${buildAiDataContext()}`;
         function parseTs(str) {
             if (!str) return null;
             str = String(str).trim();
+            // If the string contains ISO timezone specifiers (Z or offset), let native Date handle it.
+            if (/(?:Z|[+-]\d{2}(?::?\d{2})?)$/i.test(str)) {
+                const d = new Date(str);
+                if (!isNaN(d.getTime())) return d;
+            }
             // Format: DD/MM/YYYY HH:MM:SS (primary Google Sheets format)
             let m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
             if (m) return new Date(+m[3], +m[2]-1, +m[1], +m[4], +m[5], +m[6]);
@@ -13009,7 +13343,652 @@ ${buildAiDataContext()}`;
                 overlay.classList.remove('show');
             }
         }
+        // ===== VENEER MOISTURE & TEMPERATURE MONITORING FUNCTIONS =====
+        let isVeneerConnected = false;
+        let veneerTimer = null;
+        let veneerRange = 'today';
+        let veneerData = [];
+        let veneerChart = null;
+        let activeVeneerHistoricalData = [];
+
+        async function connectVeneer() {
+            isVeneerConnected = true;
+            fetchVeneerStatus();
+            fetchVeneerResistorMode();
+            fetchVeneerCalibration();
+            startVeneerRefresh();
+            showToast('Connected to Veneer Monitor!', 'success');
+        }
+
+        function disconnectVeneer() {
+            if (veneerTimer) clearInterval(veneerTimer);
+            veneerTimer = null;
+            isVeneerConnected = false;
+        }
+
+        function startVeneerRefresh() {
+            if (veneerTimer) clearInterval(veneerTimer);
+            veneerTimer = setInterval(() => {
+                fetchVeneerStatus();
+            }, 5000); // Fetch every 5 seconds
+        }
+
+        async function fetchVeneerResistorMode() {
+            try {
+                const url = VENEER_GAS_URL + '?action=getResistorMode';
+                const resp = await fetch(url);
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const json = await resp.json();
+                if (json.status === 'success' && json.resistor_mode) {
+                    const switchEl = document.getElementById('resistorSwitch');
+                    if (switchEl) {
+                        switchEl.checked = (json.resistor_mode === 'With resistor');
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to fetch veneer resistor mode:', e);
+            }
+        }
+
+        async function toggleVeneerResistor(el) {
+            const checked = el.checked;
+            const mode = checked ? 'With resistor' : 'Without resistor';
+            
+            el.disabled = true;
+            showToast('Updating resistor range mode...', 'info');
+            
+            try {
+                const url = VENEER_GAS_URL + '?action=setResistorMode&mode=' + encodeURIComponent(mode);
+                const resp = await fetch(url);
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const json = await resp.json();
+                if (json.status === 'success') {
+                    showToast('Resistor mode updated successfully!', 'success');
+                } else {
+                    throw new Error(json.message || 'Unknown error');
+                }
+            } catch (e) {
+                console.error('Failed to toggle resistor:', e);
+                showToast('Failed to update resistor mode: ' + e.message, 'error');
+                el.checked = !checked; // revert
+            } finally {
+                el.disabled = false;
+            }
+        }
+
+        // --- Veneer Calibration UI Management ---
+        let withoutResistorPoints = [];
+        let withResistorPoints = [];
+
+        async function fetchVeneerCalibration() {
+            const btnReload = document.getElementById('btnReloadCalibration');
+            const btnSave = document.getElementById('btnSaveCalibration');
+            if (btnReload) btnReload.disabled = true;
+            if (btnSave) btnSave.disabled = true;
+
+            const eqContainer = document.getElementById('fitEquationContainer');
+            if (eqContainer) {
+                const textEl = document.getElementById('fitEquationText');
+                if (textEl) textEl.textContent = 'Loading calibration from Google Sheets...';
+            }
+
+            try {
+                const url = VENEER_GAS_URL + '?action=getCalibrationData&t=' + Date.now();
+                const resp = await fetch(url);
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const json = await resp.json();
+                
+                if (json.status === 'success') {
+                    withoutResistorPoints = json.without_resistor || [];
+                    withResistorPoints = json.with_resistor || [];
+                    
+                    // Render calibration details
+                    updateCalibrationFitInfo(json.coef, json.resistor_mode);
+                    
+                    // Render tables
+                    renderCalibrationTable('without');
+                    renderCalibrationTable('with');
+                } else {
+                    throw new Error(json.message || 'Failed to fetch calibration data');
+                }
+            } catch (e) {
+                console.error('Calibration fetch error:', e);
+                showToast('Failed to load calibration settings: ' + e.message, 'error');
+                const textEl = document.getElementById('fitEquationText');
+                if (textEl) textEl.textContent = 'Error loading calibration.';
+            } finally {
+                if (btnReload) btnReload.disabled = false;
+                if (btnSave) btnSave.disabled = false;
+            }
+        }
+
+        function updateCalibrationFitInfo(coef, activeMode) {
+            const typeVal = document.getElementById('fitTypeVal');
+            const r2Val = document.getElementById('fitR2Val');
+            const eqText = document.getElementById('fitEquationText');
+            
+            if (!coef) {
+                if (typeVal) typeVal.textContent = '--';
+                if (r2Val) r2Val.textContent = '--';
+                if (eqText) eqText.textContent = 'No curve fit details available.';
+                return;
+            }
+
+            if (typeVal) typeVal.textContent = String(coef.type || 'linear').toUpperCase();
+            if (r2Val) r2Val.textContent = typeof coef.r2 === 'number' ? coef.r2.toFixed(4) : '--';
+
+            if (eqText) {
+                const a = coef.a;
+                const b = coef.b;
+                const c = coef.c;
+                const type = coef.type;
+                
+                let eqLine = '';
+                if (type === 'quadratic') {
+                    eqLine = `Moisture = (${a.toExponential(4)}) * ADC² + (${b.toFixed(5)}) * ADC + (${c.toFixed(4)})`;
+                } else {
+                    eqLine = `Moisture = (${b.toFixed(5)}) * ADC + (${c.toFixed(4)})`;
+                }
+                
+                eqText.textContent = `${eqLine}   [Active Mode: ${activeMode || 'Without resistor'}]`;
+            }
+        }
+
+        function renderCalibrationTable(type) {
+            const tableBody = document.getElementById(type === 'without' ? 'withoutResistorTableBody' : 'withResistorTableBody');
+            if (!tableBody) return;
+            
+            tableBody.innerHTML = '';
+            const points = type === 'without' ? withoutResistorPoints : withResistorPoints;
+            
+            if (points.length === 0) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td colspan="3" style="padding: 15px 4px; text-align: center; color: #666; font-style: italic;">No calibration points. Click "+ Add Calibration Point" below.</td>`;
+                tableBody.appendChild(tr);
+                return;
+            }
+
+            points.forEach((pt, index) => {
+                const tr = document.createElement('tr');
+                tr.style.borderBottom = '1px solid rgba(255,255,255,0.03)';
+                
+                const tdAdc = document.createElement('td');
+                tdAdc.style.padding = '6px 4px';
+                const inputAdc = document.createElement('input');
+                inputAdc.type = 'number';
+                inputAdc.className = 'cal-input';
+                inputAdc.value = pt.adc !== null && pt.adc !== undefined ? pt.adc : '';
+                inputAdc.placeholder = 'e.g. 500';
+                inputAdc.oninput = (e) => {
+                    points[index].adc = e.target.value !== '' ? parseFloat(e.target.value) : null;
+                };
+                tdAdc.appendChild(inputAdc);
+                
+                const tdMoisture = document.createElement('td');
+                tdMoisture.style.padding = '6px 4px';
+                const inputMoisture = document.createElement('input');
+                inputMoisture.type = 'number';
+                inputMoisture.step = '0.1';
+                inputMoisture.className = 'cal-input';
+                inputMoisture.value = pt.moisture !== null && pt.moisture !== undefined ? pt.moisture : '';
+                inputMoisture.placeholder = 'e.g. 12.5';
+                inputMoisture.oninput = (e) => {
+                    points[index].moisture = e.target.value !== '' ? parseFloat(e.target.value) : null;
+                };
+                tdMoisture.appendChild(inputMoisture);
+                
+                const tdDel = document.createElement('td');
+                tdDel.style.padding = '6px 4px';
+                tdDel.style.textAlign = 'center';
+                const delBtn = document.createElement('button');
+                delBtn.type = 'button';
+                delBtn.className = 'cal-del-btn';
+                delBtn.innerHTML = '❌';
+                delBtn.onclick = () => deleteCalibrationRow(type, index);
+                tdDel.appendChild(delBtn);
+                
+                tr.appendChild(tdAdc);
+                tr.appendChild(tdMoisture);
+                tr.appendChild(tdDel);
+                
+                tableBody.appendChild(tr);
+            });
+        }
+
+        function addCalibrationRow(type) {
+            const points = type === 'without' ? withoutResistorPoints : withResistorPoints;
+            points.push({ adc: null, moisture: null });
+            renderCalibrationTable(type);
+        }
+
+        function deleteCalibrationRow(type, index) {
+            const points = type === 'without' ? withoutResistorPoints : withResistorPoints;
+            points.splice(index, 1);
+            renderCalibrationTable(type);
+        }
+
+        async function saveVeneerCalibration() {
+            // Validate and filter
+            const filterPoints = (pts) => {
+                return pts.filter(pt => pt.adc !== null && pt.moisture !== null && !isNaN(pt.adc) && !isNaN(pt.moisture));
+            };
+
+            const cleanWithout = filterPoints(withoutResistorPoints);
+            const cleanWith = filterPoints(withResistorPoints);
+
+            // Validation check: at least 2 points required per table for fitting
+            if (cleanWithout.length < 2) {
+                showToast('Error: "Without Resistor" table must contain at least 2 valid points.', 'error');
+                alert('Curve fitting requires at least 2 calibration points for the "Without Resistor" range. Please correct and retry.');
+                return;
+            }
+            if (cleanWith.length < 2) {
+                showToast('Error: "With Resistor" table must contain at least 2 valid points.', 'error');
+                alert('Curve fitting requires at least 2 calibration points for the "With Resistor" range. Please correct and retry.');
+                return;
+            }
+
+            const btnReload = document.getElementById('btnReloadCalibration');
+            const btnSave = document.getElementById('btnSaveCalibration');
+            if (btnReload) btnReload.disabled = true;
+            if (btnSave) btnSave.disabled = true;
+
+            showToast('Saving calibration to Google Sheets...', 'info');
+
+            try {
+                const url = VENEER_GAS_URL + 
+                            '?action=saveCalibrationData' +
+                            '&without_resistor=' + encodeURIComponent(JSON.stringify(cleanWithout)) +
+                            '&with_resistor=' + encodeURIComponent(JSON.stringify(cleanWith));
+                            
+                const resp = await fetch(url);
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const json = await resp.json();
+
+                if (json.status === 'success') {
+                    showToast('Calibration saved & coefficients updated!', 'success');
+                    
+                    // Update state variables with clean arrays
+                    withoutResistorPoints = json.without_resistor || cleanWithout;
+                    withResistorPoints = json.with_resistor || cleanWith;
+
+                    updateCalibrationFitInfo(json.coef, json.resistor_mode);
+                    
+                    renderCalibrationTable('without');
+                    renderCalibrationTable('with');
+                } else {
+                    throw new Error(json.message || 'Failed to save calibration data');
+                }
+            } catch (e) {
+                console.error('Calibration save error:', e);
+                showToast('Failed to save calibration data: ' + e.message, 'error');
+            } finally {
+                if (btnReload) btnReload.disabled = false;
+                if (btnSave) btnSave.disabled = false;
+            }
+        }
+
+        async function fetchVeneerStatus() {
+            try {
+                const url = SUBLYNQ_GAS_URL + '?action=readSheet&sheetId=' + encodeURIComponent(VENEER_LIVE_SHEET_ID) + '&tab=Sheet1&t=' + Date.now();
+                const controller = new AbortController();
+                const id = setTimeout(() => controller.abort(), 10000);
+                const resp = await fetch(url, { signal: controller.signal });
+                clearTimeout(id);
+                
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const json = await resp.json();
+                if (json.error) throw new Error(json.error);
+                const rows = json.rows || [];
+                
+                if (rows.length > 1) {
+                    veneerData = rows;
+                    
+                    const lastRow = rows[rows.length - 1];
+                    const tsStr = lastRow[0];
+                    const adcVal = parseFloat(lastRow[1]) || 0;
+                    const moistVal = parseFloat(lastRow[2]) || 0;
+                    const rawTemp = lastRow.length > 3 ? (parseFloat(lastRow[3]) || null) : null;
+                    const calTemp = lastRow.length > 4 ? (parseFloat(lastRow[4]) || null) : null;
+                    
+                    document.getElementById('veneerMoistureVal').textContent = moistVal.toFixed(1) + '%';
+                    document.getElementById('veneerAdcVal').textContent = 'Raw ADC Value: ' + adcVal;
+                    
+                    if (rawTemp !== null) {
+                        document.getElementById('veneerRawTempVal').textContent = 'Raw Temp: ' + rawTemp.toFixed(1);
+                    } else {
+                        document.getElementById('veneerRawTempVal').textContent = 'Raw Temp: --';
+                    }
+                    if (calTemp !== null) {
+                        document.getElementById('veneerTempVal').textContent = calTemp.toFixed(1) + '°C';
+                        document.getElementById('veneerTempVal').style.color = '#ffaa44';
+                    } else {
+                        document.getElementById('veneerTempVal').textContent = '--.-°C';
+                        document.getElementById('veneerTempVal').style.color = '';
+                    }
+                    
+                    const lastSeenDate = parseTs(tsStr);
+                    let isOnline = false;
+                    let lastSeenStr = '--';
+                    if (lastSeenDate && !isNaN(lastSeenDate.getTime())) {
+                        const diffSec = (new Date() - lastSeenDate) / 1000;
+                        if (diffSec <= 300) {
+                            isOnline = true;
+                        }
+                        const pad = n => String(n).padStart(2, '0');
+                        lastSeenStr = `${pad(lastSeenDate.getDate())}/${pad(lastSeenDate.getMonth()+1)}/${lastSeenDate.getFullYear()} ${pad(lastSeenDate.getHours())}:${pad(lastSeenDate.getMinutes())}:${pad(lastSeenDate.getSeconds())}`;
+                    }
+                    
+                    const badge = document.getElementById('veneerStatusBadge');
+                    if (badge) {
+                        if (isOnline) {
+                            badge.textContent = 'ONLINE';
+                            badge.className = 'status-badge online';
+                        } else {
+                            badge.textContent = 'OFFLINE';
+                            badge.className = 'status-badge offline';
+                        }
+                    }
+                    const lastSeenEl = document.getElementById('veneerLastSeen');
+                    if (lastSeenEl) lastSeenEl.textContent = 'Last seen: ' + lastSeenStr;
+                    
+                    // Update table and charts dynamically
+                    if (veneerRange === 'today') {
+                        updateVeneerTable(rows);
+                        renderVeneerChart();
+                    }
+                } else {
+                    const badge = document.getElementById('veneerStatusBadge');
+                    if (badge) {
+                        badge.textContent = 'UNKNOWN';
+                        badge.className = 'status-badge unknown';
+                    }
+                    const lastSeenEl = document.getElementById('veneerLastSeen');
+                    if (lastSeenEl) lastSeenEl.textContent = 'Last seen: --';
+                }
+            } catch (e) {
+                console.error('Veneer status fetch error:', e);
+            }
+        }
+
+        async function fetchVeneerHistoricalData(startDt, endDt) {
+            const todayIST    = new Date();
+            const todayStart  = new Date(todayIST.getFullYear(), todayIST.getMonth(), todayIST.getDate(), 0, 0, 0, 0);
+            const includesToday = endDt >= todayStart;
+
+            const dayList = [];
+            const cur = new Date(startDt); cur.setHours(0,0,0,0);
+            const yesterday = new Date(todayStart.getTime() - 1);
+            const csvEnd = includesToday ? new Date(Math.min(endDt.getTime(), yesterday.getTime())) : endDt;
+            const tmpCur = new Date(cur);
+            while (tmpCur <= csvEnd) { dayList.push(new Date(tmpCur)); tmpCur.setDate(tmpCur.getDate() + 1); }
+
+            let allRows = [];
+
+            if (dayList.length > 0) {
+                const folderId = driveFolders['veneer'];
+                const csvResults = await Promise.all(dayList.map(day => dFetchDriveCsvWithFallback(day, folderId)));
+                
+                for (let idx = 0; idx < dayList.length; idx++) {
+                    const csv = csvResults[idx];
+                    if (csv) {
+                        const lines = csv.split('\n').filter(l => l.trim());
+                        if (lines.length > 1) {
+                            for (let i = 1; i < lines.length; i++) {
+                                const cells = dSplitCsvLine(lines[i]);
+                                if (cells.length >= 3) {
+                                    allRows.push(cells);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (includesToday && veneerData.length > 1) {
+                allRows = allRows.concat(veneerData.slice(1));
+            }
+
+            if (!allRows.length) return [];
+
+            const seen = new Set();
+            const filtered = allRows.filter(r => {
+                const t = parseTs(r[0]);
+                if (!t || t < startDt || t > endDt) return false;
+                const key = String(r[0]).trim();
+                if (seen.has(key)) return false;
+                seen.add(key); return true;
+            });
+            
+            filtered.sort((a, b) => (parseTs(a[0]) || 0) - (parseTs(b[0]) || 0));
+            return filtered;
+        }
+
+        async function setVeneerRange(range, btn) {
+            veneerRange = range;
+            document.querySelectorAll('#veneerRangeBar .urange-btn').forEach(b => b.classList.remove('active'));
+            if (btn) btn.classList.add('active');
+            
+            showToast('Loading Veneer history...', 'info');
+            
+            const now = new Date();
+            let startDt;
+            const endDt = now;
+            
+            if (range === 'today') {
+                const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+                startDt = todayStart;
+            } else if (range === '1h') {
+                startDt = new Date(now.getTime() - 1 * 60 * 60 * 1000);
+            } else if (range === '6h') {
+                startDt = new Date(now.getTime() - 6 * 60 * 60 * 1000);
+            } else if (range === '12h') {
+                startDt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+            } else if (range === '24h') {
+                startDt = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+            } else if (range === '3d') {
+                startDt = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+            } else if (range === '7d') {
+                startDt = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+            }
+            
+            try {
+                const history = await fetchVeneerHistoricalData(startDt, endDt);
+                activeVeneerHistoricalData = history;
+                renderVeneerChart();
+                updateVeneerTable(history);
+                showToast('Veneer history loaded', 'success');
+            } catch(e) {
+                console.error('Failed to load Veneer historical data:', e);
+                showToast('Failed to load history', 'error');
+            }
+        }
+
+        function renderVeneerChart() {
+            const ctx = document.getElementById('veneerChart');
+            if (!ctx) return;
+            
+            const dataToUse = (activeVeneerHistoricalData && activeVeneerHistoricalData.length > 0) 
+                ? activeVeneerHistoricalData 
+                : (veneerData && veneerData.length > 1 ? veneerData.slice(1) : []);
+                
+            if (dataToUse.length === 0) return;
+            
+            const moisturePoints = [];
+            const tempPoints = [];
+            let lastRealTs = null;
+            const gapMs = gapThresholdSec * 1000;
+            
+            for (let i = 0; i < dataToUse.length; i++) {
+                const row = dataToUse[i];
+                const ts = parseTs(row[0]);
+                const xVal = toChartTs(row[0]);
+                if (!ts || !xVal) continue;
+                
+                const moist = parseFloat(row[2]);
+                const rawTemp = row.length > 4 ? parseFloat(row[4]) : null;
+                
+                const valMoist = (isNaN(moist) || moist === 0) ? null : moist;
+                const valTemp = (rawTemp === null || isNaN(rawTemp) || rawTemp === 0) ? null : rawTemp;
+                
+                if (valMoist !== null) {
+                    if (!forceJoinGaps && lastRealTs !== null) {
+                        const gap = ts.getTime() - lastRealTs.getTime();
+                        if (gap > gapMs) {
+                            const midTs = new Date(lastRealTs.getTime() + gap / 2);
+                            moisturePoints.push({ x: dateToISTString(midTs), y: null });
+                            tempPoints.push({ x: dateToISTString(midTs), y: null });
+                        }
+                    }
+                    moisturePoints.push({ x: xVal, y: valMoist });
+                    if (valTemp !== null) {
+                        tempPoints.push({ x: xVal, y: valTemp });
+                    }
+                    lastRealTs = ts;
+                }
+            }
+            
+            const isLight = document.body.classList.contains('light-mode');
+            const moistureColor = isLight ? '#1565c0' : '#00d2ff'; // deep blue vs light blue
+            const tempColor = isLight ? '#c62828' : '#ff6b6b'; // deep red vs light red
+
+            const datasets = [
+                {
+                    label: 'Moisture (%)',
+                    data: moisturePoints,
+                    borderColor: moistureColor,
+                    backgroundColor: 'transparent',
+                    borderWidth: 2.5,
+                    pointRadius: 0,
+                    tension: 0,
+                    spanGaps: false,
+                    yAxisID: 'y'
+                }
+            ];
+            
+            const hasTempData = tempPoints.length > 0;
+            if (hasTempData) {
+                datasets.push({
+                    label: 'Temperature (°C)',
+                    data: tempPoints,
+                    borderColor: tempColor,
+                    backgroundColor: 'transparent',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0,
+                    spanGaps: false,
+                    yAxisID: 'y1'
+                });
+            }
+            
+            if (veneerChart) {
+                veneerChart.data.datasets = datasets;
+                if (veneerChart.options.scales.y) {
+                    if (veneerChart.options.scales.y.title) veneerChart.options.scales.y.title.color = moistureColor;
+                    if (veneerChart.options.scales.y.ticks) veneerChart.options.scales.y.ticks.color = getChartTickColor();
+                    if (veneerChart.options.scales.y.grid) veneerChart.options.scales.y.grid.color = getChartGridColor();
+                }
+                if (veneerChart.options.scales.y1) {
+                    veneerChart.options.scales.y1.display = hasTempData;
+                    if (veneerChart.options.scales.y1.title) veneerChart.options.scales.y1.title.color = tempColor;
+                    if (veneerChart.options.scales.y1.ticks) veneerChart.options.scales.y1.ticks.color = getChartTickColor();
+                }
+                if (veneerChart.options.scales.x) {
+                    if (veneerChart.options.scales.x.ticks) veneerChart.options.scales.x.ticks.color = getChartTickColor();
+                    if (veneerChart.options.scales.x.grid) veneerChart.options.scales.x.grid.color = getChartGridColor();
+                }
+                if (veneerChart.options.plugins && veneerChart.options.plugins.legend && veneerChart.options.plugins.legend.labels) {
+                    veneerChart.options.plugins.legend.labels.color = getChartTickColor();
+                }
+                if (veneerChart.options.plugins && veneerChart.options.plugins.tooltip) {
+                    veneerChart.options.plugins.tooltip.backgroundColor = isLight ? 'rgba(255,255,255,0.97)' : 'rgba(0,15,35,0.95)';
+                    veneerChart.options.plugins.tooltip.borderColor = getChartGridColor();
+                    veneerChart.options.plugins.tooltip.titleColor = getChartTickColor();
+                    veneerChart.options.plugins.tooltip.bodyColor = getChartTickColor();
+                }
+                veneerChart.update('none');
+            } else {
+                veneerChart = new Chart(ctx.getContext('2d'), {
+                    type: 'line',
+                    data: { datasets },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        animation: false,
+                        interaction: { mode: 'index', intersect: false },
+                        scales: {
+                            x: {
+                                type: 'time',
+                                time: { tooltipFormat: 'dd/LL/yyyy HH:mm:ss', displayFormats: { minute: 'HH:mm', hour: 'HH:mm', day: 'dd/LL' } },
+                                ticks: { color: getChartTickColor(), maxTicksLimit: 8 },
+                                grid: { color: getChartGridColor() }
+                            },
+                            y: {
+                                type: 'linear',
+                                display: true,
+                                position: 'left',
+                                title: { display: true, text: 'Moisture (%)', color: moistureColor },
+                                ticks: { color: getChartTickColor(), callback: v => v.toFixed(1) + '%' },
+                                grid: { color: getChartGridColor() }
+                            },
+                            y1: {
+                                type: 'linear',
+                                display: hasTempData,
+                                position: 'right',
+                                title: { display: true, text: 'Temperature (°C)', color: tempColor },
+                                ticks: { color: getChartTickColor(), callback: v => v.toFixed(1) + '°' },
+                                grid: { drawOnChartArea: false }
+                            }
+                        },
+                        plugins: {
+                            legend: { labels: { color: getChartTickColor(), font: { family: 'Share Tech Mono' } } },
+                            tooltip: {
+                                backgroundColor: isLight ? 'rgba(255,255,255,0.97)' : 'rgba(0,15,35,0.95)',
+                                borderColor: getChartGridColor(),
+                                borderWidth: 1,
+                                titleColor: getChartTickColor(),
+                                bodyColor: getChartTickColor()
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        function updateVeneerTable(rows) {
+            const body = document.getElementById('veneerTableBody');
+            if (!body) return;
+            
+            if (!rows || rows.length <= 1) {
+                body.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #888; padding: 20px;">No readings found.</td></tr>';
+                return;
+            }
+            
+            const dataRows = rows.slice(1).slice(-100).reverse();
+            let html = '';
+            for (const r of dataRows) {
+                const ts = r[0];
+                const adc = parseFloat(r[1]) || 0;
+                const moist = parseFloat(r[2]) || 0;
+                const rawTemp = r.length > 3 ? (parseFloat(r[3]) || null) : null;
+                const calTemp = r.length > 4 ? (parseFloat(r[4]) || null) : null;
+                
+                const rawTempText = rawTemp !== null ? rawTemp.toFixed(1) : '<span style="color:#555">Future Scope</span>';
+                const calTempText = calTemp !== null ? calTemp.toFixed(1) : '<span style="color:#555">Future Scope</span>';
+                
+                html += `<tr>
+                    <td style="font-family: 'Share Tech Mono', monospace;">${ts}</td>
+                    <td style="font-family: 'Share Tech Mono', monospace;">${adc}</td>
+                    <td style="font-family: 'Share Tech Mono', monospace; font-weight: bold; color: #00ffcc;">${moist.toFixed(1)}%</td>
+                    <td style="font-family: 'Share Tech Mono', monospace;">${rawTempText}</td>
+                    <td style="font-family: 'Share Tech Mono', monospace;">${calTempText}</td>
+                </tr>`;
+            }
+            body.innerHTML = html;
+        }
+
         // ===== LIGHT/DARK THEME TOGGLE =====
+
         // Chamber colors: dark mode vs light mode
         const CHAMBER_COLORS_DARK  = ['#ff3333','#3399ff','#ff8800','#00cc44','#00e5ff','#ff00cc'];
         const CHAMBER_COLORS_LIGHT = ['#cc1100','#0055cc','#cc6600','#007a30','#007a96','#aa0088'];
@@ -13044,6 +14023,9 @@ ${buildAiDataContext()}`;
             }
             if (typeof renderCsvChart === 'function') {
                 try { renderCsvChart(); } catch(e){}
+            }
+            if (typeof renderVeneerChart === 'function') {
+                try { renderVeneerChart(); } catch(e){}
             }
             // Update ALL registered Chart.js instances with new tick/grid colors
             try {
