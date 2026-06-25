@@ -1,0 +1,1865 @@
+var NUM_DRYERS                = 2;  // Dryers 5-6 (ETH ESP32-S3)
+var FIRST_DRYER               = 5;
+var NUM_CHAMBERS              = 8;
+var TOTAL_CHANNELS            = NUM_DRYERS * NUM_CHAMBERS; // 16 (2 dryers x 8 channels)
+var ALERT_COOLDOWN_MS         = 5 * 60 * 1000;
+var MERGE_WINDOW_SECONDS      = 30;
+var LOOKBACK_MINUTES          = 5;
+var MCU_OFF_THRESHOLD_SECONDS = 240;
+var DEFAULT_UPPER_THRESHOLD   = 200;
+var DEFAULT_LOWER_THRESHOLD   = 10;
+var DEFAULT_STATUS_TIMEOUT    = 120;
+var DEFAULT_MERGE_WINDOW      = 30;
+var MIN_DRYER_OFF_SECONDS     = 240;
+
+var SETTINGS_SHEET_NAME = "Settings";
+var DRIVE_BACKUP_FOLDER_ID = "17DHy6YoELh214ZfRft56sJaRg9y_GkHi"; 
+
+var PROTECTED_SHEET_NAMES = [
+  "Sheet1",
+  "Settings",
+  "APIs",
+  "Thresholds Sheet",
+  "Status Sheet",
+  "Alert History",
+  "MCU Availability",
+  "Dryer Availability",
+  "Demo Data",
+  "Email IDs"
+];
+
+var CONFIG_SHEETS_TO_BACKUP = [
+  "APIs",
+  "Thresholds Sheet",
+  "Status Sheet",
+  "Alert History",
+  "MCU Availability",
+  "Dryer Availability",
+  "Email IDs",
+  "Settings"
+];
+
+var TELEGRAM_BOT_TOKEN = "8663310055:AAGgp5jzYljvDMrd0QBJ2k8UUUzzEL6GXvU";
+
+function getTwilioConfig() {
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("APIs");
+    if (!sheet) return null;
+    var data = sheet.getRange("B2:B5").getValues();
+    var fromNum = "14155238886";
+    var toNum   = (data[3][0] || "").toString().trim();
+    if (fromNum && !fromNum.startsWith("+")) fromNum = "+" + fromNum;
+    if (toNum   && !toNum.startsWith("+"))   toNum   = "+" + toNum;
+    var config = {
+      sid:   (data[0][0] || "").toString().trim(),
+      token: (data[1][0] || "").toString().trim(),
+      from:  fromNum,
+      to:    toNum
+    };
+    if (config.sid && config.token && config.from && config.to) return config;
+    return null;
+  } catch (e) {
+    Logger.log("getTwilioConfig error: " + e.toString());
+    return null;
+  }
+}
+
+function getTelegramChatIds() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty("TELEGRAM_CHAT_IDS") || "";
+    var ids = raw.split(",").map(function(s){ return s.trim(); }).filter(function(s){ return s.length > 0; });
+    return ids;
+  } catch(e) {
+    Logger.log("getTelegramChatIds error: " + e.toString());
+    return [];
+  }
+}
+
+function sendTelegramMessage(chatIds, text) {
+  if (!chatIds || chatIds.length === 0) return;
+  if (!Array.isArray(chatIds)) chatIds = [chatIds];
+  var url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage";
+  chatIds.forEach(function(chatId) {
+    if (!chatId) return;
+    try {
+      var payload = JSON.stringify({ chat_id: chatId, text: text, parse_mode: "HTML" });
+      var options = { method: "post", contentType: "application/json", payload: payload, muteHttpExceptions: true };
+      var response = UrlFetchApp.fetch(url, options);
+      var result = JSON.parse(response.getContentText());
+      if (!result.ok) Logger.log("Telegram send failed for chat_id " + chatId + ": " + JSON.stringify(result));
+      else Logger.log("Telegram message sent to chat_id: " + chatId);
+    } catch (err) {
+      Logger.log("Telegram error for chat_id " + chatId + ": " + err.toString());
+    }
+  });
+}
+
+function sendWhatsappMessage(text) {
+  var config = getTwilioConfig();
+  if (!config) {
+    Logger.log("Twilio config not found or incomplete. Skipping WhatsApp message.");
+    return;
+  }
+  var url = "https://api.twilio.com/2010-04-01/Accounts/" + config.sid + "/Messages.json";
+  var payload = { "To": "whatsapp:" + config.to, "From": "whatsapp:" + config.from, "Body": text };
+  var options = {
+    "method": "post", "payload": payload,
+    "headers": { "Authorization": "Basic " + Utilities.base64Encode(config.sid + ":" + config.token) },
+    "muteHttpExceptions": true
+  };
+  try {
+    var response = UrlFetchApp.fetch(url, options);
+    var result = JSON.parse(response.getContentText());
+    if (result.error_message) Logger.log("Twilio send failed: " + result.error_message);
+    else Logger.log("Twilio message sent successfully to: " + config.to);
+  } catch (err) {
+    Logger.log("Twilio error: " + err.toString());
+  }
+}
+
+function buildTelegramEscalationMessage(alerts, intervalMin) {
+  var lines = [];
+  lines.push("<b>🚨 Dryer Temperature Alert</b>");
+  lines.push("This Alert may repeat every " + intervalMin + " min until resolved\n");
+  alerts.forEach(function(a) {
+    var typeStr = a.alertType === "LOW" ? "⬇️ BELOW LOWER" : "⬆️ ABOVE UPPER";
+    lines.push("<b>Dryer " + a.dryer + " – Chamber " + a.chamber + "</b> [" + typeStr + " THRESHOLD]");
+    lines.push("  Peak: " + a.peak.toFixed(2) + "°C  |  Threshold: " + a.threshold + "°C");
+    lines.push("  Started: " + a.startTime);
+    lines.push("");
+  });
+  lines.push("— CPIL Chennai- Dryer Temperature Monitoring System");
+  return lines.join("\n");
+}
+
+function buildTelegramResolutionMessage(alert, currentTemp, durSec) {
+  var lines = [];
+  lines.push("<b>✅ Alert RESOLVED</b>\n");
+  var typeStr   = alert.alertType === "LOW" ? "⬇️ Below Lower" : "⬆️ Above Upper";
+  var diffLabel = alert.alertType === "LOW"  ? "above lower threshold" : "below upper threshold";
+  var diff      = Math.abs(currentTemp - alert.threshold).toFixed(2);
+  lines.push("<b>Dryer " + alert.dryer + " – Chamber " + alert.chamber + "</b>");
+  lines.push("  Type: " + typeStr + " Threshold");
+  lines.push("  Alert started: " + alert.startTime);
+  lines.push("  Resolved at:   " + alert.resolvedTime);
+  lines.push("  Duration:      " + formatDurationGas(durSec || 0));
+  lines.push("  Peak temp:     " + alert.peak.toFixed(2) + "°C");
+  lines.push("  Threshold:     " + alert.threshold + "°C");
+  lines.push("  Current temp:  " + currentTemp.toFixed(2) + "°C  (" + diff + "°C " + diffLabel + ")");
+  lines.push("");
+  lines.push("— CPIL Chennai - Dryer Temperature Monitoring System");
+  return lines.join("\n");
+}
+
+function buildWhatsappAlertMessage(alerts, intervalMin) {
+  var lines = [];
+  lines.push("🚨 *Dryer Temperature Alert* 🚨");
+  lines.push("This alert may repeat every " + intervalMin + " min until resolved.\n");
+  alerts.forEach(function(a) {
+    var typeStr = a.alertType === "LOW" ? "⬇️ BELOW LOWER" : "⬆️ ABOVE UPPER";
+    lines.push("*Dryer " + a.dryer + " – Chamber " + a.chamber + "* [" + typeStr + " THRESHOLD]");
+    lines.push("  Peak: " + a.peak.toFixed(2) + "°C  |  Threshold: " + a.threshold + "°C");
+    lines.push("  Started: " + a.startTime);
+    lines.push("");
+  });
+  lines.push("— CPIL Chennai Dryer Temperature Monitoring System");
+  return lines.join("\n");
+}
+
+function buildWhatsappResolutionMessage(alert, currentTemp, durSec) {
+  var lines = [];
+  lines.push("✅ *Alert RESOLVED* ✅\n");
+  var typeStr   = alert.alertType === "LOW" ? "⬇️ Below Lower" : "⬆️ Above Upper";
+  var diffLabel = alert.alertType === "LOW"  ? "above lower threshold" : "below upper threshold";
+  var diff      = Math.abs(currentTemp - alert.threshold).toFixed(2);
+  lines.push("*Dryer " + alert.dryer + " – Chamber " + alert.chamber + "*");
+  lines.push("  Type: " + typeStr + " Threshold");
+  lines.push("  Alert started: " + alert.startTime);
+  lines.push("  Resolved at:   " + alert.resolvedTime);
+  lines.push("  Duration:      " + formatDurationGas(durSec || 0));
+  lines.push("  Peak temp:     " + alert.peak.toFixed(2) + "°C");
+  lines.push("  Threshold:     " + alert.threshold + "°C");
+  lines.push("  Current temp:  " + currentTemp.toFixed(2) + "°C  (" + diff + "°C " + diffLabel + ")");
+  lines.push("");
+  lines.push("— CPIL Chennai - Dryer Temperature Monitoring System");
+  return lines.join("\n");
+}
+
+function readHysteresis(threshSheet) {
+  try {
+    var upperVal = threshSheet.getRange("B6").getValue();
+    var lowerVal = threshSheet.getRange("B7").getValue();
+    var upper = parseFloat(upperVal);
+    var lower = parseFloat(lowerVal);
+    return {
+      upper: isNaN(upper) ? 0 : upper,
+      lower: isNaN(lower) ? 0 : lower
+    };
+  } catch(e) {
+    Logger.log("readHysteresis error: " + e.toString());
+    return { upper: 0, lower: 0 };
+  }
+}
+
+function ensureHysteresisLabels(threshSheet) {
+  try {
+    var b5 = threshSheet.getRange("A6").getValue();
+    if (!b5 || b5.toString().trim() === "") {
+      threshSheet.getRange("A6").setValue("Upper Hysteresis (°C)");
+      threshSheet.getRange("A6").setFontWeight("bold");
+    }
+    var b7label = threshSheet.getRange("A7").getValue();
+    if (!b7label || b7label.toString().trim() === "") {
+      threshSheet.getRange("A7").setValue("Lower Hysteresis (°C)");
+      threshSheet.getRange("A7").setFontWeight("bold");
+    }
+    var b6 = threshSheet.getRange("B6").getValue();
+    if (b6 === "" || b6 === null || b6 === undefined) threshSheet.getRange("B6").setValue(0);
+    var b7 = threshSheet.getRange("B7").getValue();
+    if (b7 === "" || b7 === null || b7 === undefined) threshSheet.getRange("B7").setValue(0);
+  } catch(e) {
+    Logger.log("ensureHysteresisLabels error: " + e.toString());
+  }
+}
+
+// =========================================================
+// DATE-NAMED SHEET ARCHIVING
+// =========================================================
+
+var MONTH_NAMES = [
+  'January','February','March','April','May','June',
+  'July','August','September','October','November','December'
+];
+
+function getDateSheetName(date) {
+  var d = date || new Date();
+  return d.getDate() + ' ' + MONTH_NAMES[d.getMonth()] + ' ' + d.getFullYear();
+}
+
+function isDateSheet(name) {
+  return /^\d{1,2}\s[A-Z][a-z]+\s\d{4}$/.test(name);
+}
+
+function isProtectedSheet(name) {
+  for (var i = 0; i < PROTECTED_SHEET_NAMES.length; i++) {
+    if (PROTECTED_SHEET_NAMES[i] === name) return true;
+  }
+  return false;
+}
+
+function getAllDataSheetNames(ss) {
+  var names = ['Sheet1'];
+  ss.getSheets().forEach(function(s) {
+    var nm = s.getName();
+    if (nm !== 'Sheet1' && isDateSheet(nm)) names.push(nm);
+  });
+  return names;
+}
+
+// =========================================================
+// GOOGLE DRIVE BACKUP HELPERS
+// =========================================================
+
+function getDriveBackupSubFolder(year) {
+  try {
+    var rootFolder = DriveApp.getFolderById(DRIVE_BACKUP_FOLDER_ID);
+    var yearStr = year.toString();
+    var subFolders = rootFolder.getFoldersByName(yearStr);
+    if (subFolders.hasNext()) {
+      return subFolders.next();
+    } else {
+      Logger.log("Drive: Creating year sub-folder: " + yearStr);
+      return rootFolder.createFolder(yearStr);
+    }
+  } catch(e) {
+    Logger.log("getDriveBackupSubFolder error: " + e.toString());
+    return null;
+  }
+}
+
+function getDriveConfigFolder() {
+  try {
+    var rootFolder = DriveApp.getFolderById(DRIVE_BACKUP_FOLDER_ID);
+    var folderName = "Config Snapshots";
+    var existing = rootFolder.getFoldersByName(folderName);
+    if (existing.hasNext()) {
+      return existing.next();
+    } else {
+      Logger.log("Drive: Creating 'Config Snapshots' folder.");
+      return rootFolder.createFolder(folderName);
+    }
+  } catch(e) {
+    Logger.log("getDriveConfigFolder error: " + e.toString());
+    return null;
+  }
+}
+
+function arrayToCsv(data) {
+  return data.map(function(row) {
+    return row.map(function(cell) {
+      var val = (cell === null || cell === undefined) ? "" : cell.toString();
+      if (val.indexOf('"') !== -1 || val.indexOf(',') !== -1 || val.indexOf('\n') !== -1) {
+        val = '"' + val.replace(/"/g, '""') + '"';
+      }
+      return val;
+    }).join(",");
+  }).join("\n");
+}
+
+function backupSheetToDrive(archSheet, sheetName, sheetDate) {
+  try {
+    var lastRow = archSheet.getLastRow();
+    if (lastRow < 1) {
+      Logger.log("Drive backup: sheet '" + sheetName + "' is empty, skipping.");
+      return;
+    }
+
+    var numCols    = archSheet.getLastColumn();
+    var allData    = archSheet.getRange(1, 1, lastRow, numCols).getValues();
+    var csvContent = arrayToCsv(allData);
+    var month = String(sheetDate.getMonth() + 1).padStart(2, '0');
+    var day   = String(sheetDate.getDate()).padStart(2, '0');
+    var fileName = sheetDate.getFullYear() + "-" + month + "-" + day + ".csv";
+    var csvBlob    = Utilities.newBlob(csvContent, "text/csv", fileName);
+
+    var year         = sheetDate.getFullYear();
+    var targetFolder = getDriveBackupSubFolder(year);
+    if (!targetFolder) {
+      Logger.log("Drive backup: could not get/create target folder for year " + year + ". Skipping.");
+      return;
+    }
+
+    var existing = targetFolder.getFilesByName(fileName);
+    while (existing.hasNext()) {
+      existing.next().setTrashed(true);
+      Logger.log("Drive backup: trashed old file: " + fileName);
+    }
+
+    targetFolder.createFile(csvBlob);
+    Logger.log("Drive backup: uploaded '" + fileName + "' (" + lastRow + " rows) to folder '" + targetFolder.getName() + "'.");
+  } catch(e) {
+    Logger.log("Drive backup ERROR for sheet '" + sheetName + "': " + e.toString());
+  }
+}
+
+function backupConfigSheetsToDrive() {
+  var ss           = SpreadsheetApp.getActiveSpreadsheet();
+  var configFolder = getDriveConfigFolder();
+  if (!configFolder) {
+    Logger.log("backupConfigSheetsToDrive: could not access 'Config Snapshots' folder. Skipping.");
+    return;
+  }
+
+  var tz      = Session.getScriptTimeZone();
+  var today   = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+  var backed  = 0;
+
+  CONFIG_SHEETS_TO_BACKUP.forEach(function(sheetName) {
+    var sh = ss.getSheetByName(sheetName);
+    if (!sh) {
+      Logger.log("backupConfigSheetsToDrive: sheet '" + sheetName + "' not found, skipping.");
+      return;
+    }
+
+    var lastRow = sh.getLastRow();
+    if (lastRow < 1) {
+      Logger.log("backupConfigSheetsToDrive: sheet '" + sheetName + "' is empty, skipping.");
+      return;
+    }
+
+    var numCols    = sh.getLastColumn();
+    var allData    = sh.getRange(1, 1, lastRow, numCols).getValues();
+    var csvContent = arrayToCsv(allData);
+
+    var safeName = sheetName.replace(/[\s\/\\]+/g, "_");
+    var fileName = "Config_5-6_" + safeName + "_" + today + ".csv";
+    var csvBlob  = Utilities.newBlob(csvContent, "text/csv", fileName);
+
+    var existing = configFolder.getFilesByName(fileName);
+    while (existing.hasNext()) {
+      existing.next().setTrashed(true);
+    }
+
+    configFolder.createFile(csvBlob);
+    Logger.log("backupConfigSheetsToDrive: backed up '" + sheetName + "' → '" + fileName + "' (" + lastRow + " rows).");
+    backed++;
+  });
+
+  Logger.log("backupConfigSheetsToDrive: done. Backed up " + backed + " config sheet(s).");
+}
+
+function backupAllArchiveSheetsToDrive() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheets = ss.getSheets();
+    var backedUp = 0;
+    sheets.forEach(function(sh) {
+      var nm = sh.getName();
+      if (!isDateSheet(nm)) return;
+      var parts = nm.split(' ');
+      var day   = parseInt(parts[0]);
+      var mon   = MONTH_NAMES.indexOf(parts[1]);
+      var yr    = parseInt(parts[2]);
+      if (isNaN(day) || mon === -1 || isNaN(yr)) return;
+      var sheetDate = new Date(yr, mon, day);
+      backupSheetToDrive(sh, nm, sheetDate);
+      backedUp++;
+    });
+    Logger.log("backupAllArchiveSheetsToDrive: backed up " + backedUp + " sheet(s).");
+  } catch(e) {
+    Logger.log("backupAllArchiveSheetsToDrive error: " + e.toString());
+  }
+}
+
+function deleteAlertHistorySnapshotSheets() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheets = ss.getSheets();
+    var deletedCount = 0;
+    var alertHistoryPattern = /^Alert History \d{1,2} [A-Z][a-z]+ \d{4}$/;
+    sheets.forEach(function(sheet) {
+      var nm = sheet.getName();
+      if (alertHistoryPattern.test(nm)) {
+        Logger.log("Deleting Alert History snapshot: " + nm);
+        ss.deleteSheet(sheet);
+        deletedCount++;
+      }
+    });
+    Logger.log("deleteAlertHistorySnapshotSheets: Deleted " + deletedCount + " sheet(s).");
+    return deletedCount;
+  } catch(e) {
+    Logger.log("deleteAlertHistorySnapshotSheets error: " + e.toString());
+    return 0;
+  }
+}
+
+// =========================================================
+// AUTO-ARCHIVE PREVIOUS DAY  (midnight trigger)
+// =========================================================
+function autoArchivePreviousDay() {
+  try {
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
+    var dataSheet   = getOrCreateSheet(ss, 'Sheet1');
+    var lastRow     = dataSheet.getLastRow();
+    if (lastRow < 2) {
+      Logger.log('autoArchivePreviousDay: nothing to archive.');
+      backupConfigSheetsToDrive();
+      deleteOldArchiveSheets();
+      return;
+    }
+
+    var now           = new Date();
+    var todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+
+    var data    = dataSheet.getRange(2, 1, lastRow - 1, TOTAL_CHANNELS + 1).getValues();
+    var headers = dataSheet.getRange(1, 1, 1, TOTAL_CHANNELS + 1).getValues()[0];
+
+    var byDate     = {};
+    var rowsToKeep = [];
+
+    for (var i = 0; i < data.length; i++) {
+      var row = data[i];
+      if (!row[0]) continue;
+      var ts = parseSheetTimestamp(row[0].toString());
+      if (!ts) { rowsToKeep.push(row); continue; }
+
+      if (ts >= todayMidnight) {
+        rowsToKeep.push(row);
+      } else {
+        var dateKey = ts.getDate() + '_' + ts.getMonth() + '_' + ts.getFullYear();
+        if (!byDate[dateKey]) byDate[dateKey] = { date: ts, rows: [] };
+        byDate[dateKey].rows.push(row);
+      }
+    }
+
+    var archivedCount  = 0;
+    var sheetsToBackup = [];
+
+    for (var key in byDate) {
+      var group     = byDate[key];
+      var sheetName = getDateSheetName(group.date);
+      var archSheet = getOrCreateSheet(ss, sheetName);
+
+      if (archSheet.getLastRow() === 0) {
+        archSheet.appendRow(headers);
+        archSheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+        archSheet.setFrozenRows(1);
+      }
+
+      var existingLast = archSheet.getLastRow();
+      archSheet.getRange(existingLast + 1, 1, group.rows.length, TOTAL_CHANNELS + 1)
+               .setValues(group.rows);
+      archivedCount += group.rows.length;
+      Logger.log('autoArchivePreviousDay: archived ' + group.rows.length + ' rows to "' + sheetName + '"');
+
+      sheetsToBackup.push({ sheet: archSheet, name: sheetName, date: group.date });
+    }
+
+    dataSheet.clearContents();
+    dataSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    dataSheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+    dataSheet.setFrozenRows(1);
+    if (rowsToKeep.length > 0) {
+      dataSheet.getRange(2, 1, rowsToKeep.length, TOTAL_CHANNELS + 1)
+               .setValues(rowsToKeep);
+    }
+
+    Logger.log('autoArchivePreviousDay: done. Archived ' + archivedCount +
+               ' rows. Kept ' + rowsToKeep.length + ' rows in Sheet1.');
+
+    sheetsToBackup.forEach(function(item) {
+      backupSheetToDrive(item.sheet, item.name, item.date);
+    });
+
+  } catch(err) {
+    Logger.log('autoArchivePreviousDay ERROR: ' + err.toString());
+  }
+
+  backupConfigSheetsToDrive();
+  deleteOldArchiveSheets();
+}
+
+// =========================================================
+// AUTO-DELETE OLD ARCHIVE SHEETS
+// =========================================================
+function deleteOldArchiveSheets() {
+  var ss            = SpreadsheetApp.getActiveSpreadsheet();
+  var settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+
+  if (!settingsSheet) {
+    Logger.log("Settings sheet not found. Skipping auto-delete.");
+    return;
+  }
+
+  var daysToKeep = settingsSheet.getRange("B1").getValue();
+
+  if (!daysToKeep || isNaN(daysToKeep) || daysToKeep <= 0) {
+    Logger.log("Invalid or missing value in Settings B1. Skipping auto-delete.");
+    return;
+  }
+
+  var cutoff    = new Date(new Date().getTime() - (daysToKeep * 24 * 60 * 60 * 1000));
+  var cutoffYr  = cutoff.getFullYear();
+  var cutoffMo  = cutoff.getMonth() + 1;
+  var cutoffDy  = cutoff.getDate();
+  var cutoffInt = cutoffYr * 10000 + cutoffMo * 100 + cutoffDy;
+
+  Logger.log("Auto-delete: keeping last " + daysToKeep + " days. Cutoff: " +
+             cutoffYr + "-" + cutoffMo + "-" + cutoffDy);
+
+  var allSheets    = ss.getSheets();
+  var deletedCount = 0;
+
+  for (var i = 0; i < allSheets.length; i++) {
+    var sheet     = allSheets[i];
+    var sheetName = sheet.getName();
+
+    if (isProtectedSheet(sheetName)) continue;
+    if (!isDateSheet(sheetName)) continue;
+
+    var parts    = sheetName.trim().split(' ');
+    var day      = parseInt(parts[0]);
+    var month    = MONTH_NAMES.indexOf(parts[1]) + 1;
+    var year     = parseInt(parts[2]);
+    if (isNaN(day) || month === 0 || isNaN(year)) continue;
+
+    var sheetInt = year * 10000 + month * 100 + day;
+
+    if (sheetInt < cutoffInt) {
+      Logger.log("Deleting old archive sheet: " + sheetName);
+      ss.deleteSheet(sheet);
+      deletedCount++;
+    }
+  }
+
+  Logger.log("Auto-delete done. Deleted " + deletedCount + " old archive sheet(s).");
+}
+
+// =========================================================
+// MCU OFFLINE EMAIL TRACKING
+// =========================================================
+function getMcuOfflineState() {
+  try {
+    var cache = CacheService.getScriptCache();
+    var val = cache.get("mcu_offline_state");
+    return val || null;
+  } catch(e) { return null; }
+}
+
+function setMcuOfflineState(val) {
+  try {
+    var cache = CacheService.getScriptCache();
+    if (val === null) cache.remove("mcu_offline_state");
+    else cache.put("mcu_offline_state", val, 86400);
+  } catch(e) {}
+}
+
+function isMcuCurrentlyOnline(statusSheet) {
+  try {
+    var timeout = getStatusTimeout(statusSheet);
+    var numRows = statusSheet.getLastRow();
+    if (numRows < 2) return false;
+    var now = new Date();
+    var data = statusSheet.getRange(2, 1, numRows - 1, 3).getValues();
+    for (var i = 0; i < data.length; i++) {
+      var lastTs = parseSheetTimestamp(data[i][2].toString());
+      if (lastTs && (now - lastTs) / 1000 <= timeout) return true;
+    }
+    return false;
+  } catch(e) {
+    Logger.log("isMcuCurrentlyOnline error: " + e.toString());
+    return false;
+  }
+}
+
+function sendMcuOfflineEmail(recipients, telegramIds, offlineTs) {
+  var tz  = Session.getScriptTimeZone();
+  var tsStr = Utilities.formatDate(offlineTs, tz, "dd/MM/yyyy HH:mm:ss");
+  var subject = "⚆⚆  Dryer Temperature Monitor – MCU OFFLINE at " + tsStr;
+  var body = "Dryer Temperature Monitor – MCU OFFLINE\n" +
+    "============================================================\n\n" +
+    "The Microcontroller (MCU) went offline at: " + tsStr + "\n\n" +
+    "No temperature data is being received. All dryer states are unknown.\n" +
+    "No further alert emails will be sent while the MCU is offline.\n\n" +
+    "--\nCPIL Chennai - Dryer Temperature Monitoring System (Auto-alert)";
+  try {
+    if (recipients && recipients.length > 0) GmailApp.sendEmail(recipients.join(","), subject, body, {htmlBody: body.replace(/\n/g, "<br>")});
+  } catch(e) {
+    try { if (recipients && recipients.length > 0) MailApp.sendEmail({ to: recipients.join(","), subject: subject, body: body }); } catch(e2) {}
+  }
+  if (telegramIds && telegramIds.length > 0) {
+    sendTelegramMessage(telegramIds, "⚆⚆  <b>MCU OFFLINE</b>\n\nDryer Temperature Monitor MCU went offline at <b>" + tsStr + "</b>.\n\nNo further alerts until MCU is back online.\n\n— CPIL Chennai");
+  }
+  try { sendWhatsappMessage("⚆⚆  *MCU OFFLINE*\n\nDryer Temperature Monitor MCU went offline at " + tsStr + ".\n\nNo further alerts until MCU is back online.\n\n— CPIL Chennai"); } catch(e) {}
+}
+
+function sendMcuOnlineEmail(recipients, telegramIds, offlineMs, onlineTs) {
+  var tz  = Session.getScriptTimeZone();
+  var tsStr = Utilities.formatDate(onlineTs, tz, "dd/MM/yyyy HH:mm:ss");
+  var durSec = Math.round((onlineTs.getTime() - offlineMs) / 1000);
+  var subject = "✪✪ Dryer Temperature Monitor – MCU BACK ONLINE at " + tsStr;
+  var body = "Dryer Temperature Monitor – MCU BACK ONLINE\n" +
+    "============================================================\n\n" +
+    "The Microcontroller (MCU) is back online at: " + tsStr + "\n" +
+    "Offline duration: " + formatDurationGas(durSec) + "\n\n" +
+    "Temperature monitoring has resumed normally.\n\n" +
+    "--\nCPIL Chennai - Dryer Temperature Monitoring System (Auto-alert)";
+  try {
+    if (recipients && recipients.length > 0) GmailApp.sendEmail(recipients.join(","), subject, body, {htmlBody: body.replace(/\n/g, "<br>")});
+  } catch(e) {
+    try { if (recipients && recipients.length > 0) MailApp.sendEmail({ to: recipients.join(","), subject: subject, body: body }); } catch(e2) {}
+  }
+  if (telegramIds && telegramIds.length > 0) {
+    sendTelegramMessage(telegramIds, "✪✪ <b>MCU BACK ONLINE</b>\n\nDryer Temperature Monitor MCU is back online at <b>" + tsStr + "</b>.\nOffline duration: " + formatDurationGas(durSec) + "\n\n— CPIL Chennai");
+  }
+  try { sendWhatsappMessage("✪✪ *MCU BACK ONLINE*\n\nDryer Temperature Monitor MCU is back online at " + tsStr + ".\nOffline duration: " + formatDurationGas(durSec) + "\n\n— CPIL Chennai"); } catch(e) {}
+}
+
+// =========================================================
+// doGet Router
+// =========================================================
+function doGet(e) {
+  try {
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
+    var dataSheet   = getOrCreateSheet(ss, "Sheet1");
+    var threshSheet = getOrCreateSheet(ss, "Thresholds Sheet");
+    var statusSheet = getOrCreateSheet(ss, "Status Sheet");
+    var emailSheet  = getOrCreateSheet(ss, "Email IDs");
+    var alertSheet  = getOrCreateSheet(ss, "Alert History");
+
+    var action = (e.parameter && e.parameter.action) ? e.parameter.action : "";
+
+    if (action === "write" || (e.parameter && e.parameter.dryer !== undefined && action === "")) {
+      return handleWrite(e, ss, dataSheet, threshSheet, statusSheet, emailSheet, alertSheet);
+    }
+
+    if (action === "writeAll") {
+      return handleWriteAll(e, ss, dataSheet, threshSheet, statusSheet, emailSheet, alertSheet);
+    }
+
+    if (action === "setThreshold")               return handleSetThreshold(e, threshSheet);
+    if (action === "setLowerThreshold")          return handleSetLowerThreshold(e, threshSheet);
+    if (action === "getThresholds")              return handleGetThresholds(threshSheet);
+    if (action === "getLowerThresholds")         return handleGetLowerThresholdsAction(threshSheet);
+    if (action === "getStatus")                  return handleGetStatus(statusSheet);
+    if (action === "getStatusTimeout")           return handleGetStatusTimeout(statusSheet);
+    if (action === "getAlertHistory")            return handleGetAlertHistory(e, alertSheet, threshSheet);
+    if (action === "generateAlerts")             return handleGenerateAlerts(ss, dataSheet, threshSheet, alertSheet);
+    if (action === "addEmail")                   return handleAddEmail(e, emailSheet);
+    if (action === "removeEmail")                return handleRemoveEmail(e, emailSheet);
+    if (action === "getEmails")                  return handleGetEmails(emailSheet);
+    if (action === "getAvailability")            return handleGetAvailability(e, ss, dataSheet);
+    if (action === "generateAvailabilitySheets") return handleGenerateAvailabilitySheets(ss, dataSheet);
+    if (action === "aiChat")                     return handleAiChat(e, ss, dataSheet, threshSheet, statusSheet);
+    if (action === "getApiKeys")                 return handleGetApiKeys(ss);
+    if (action === "escalGetContacts")           return handleEscalGetContacts(emailSheet);
+    if (action === "escalSaveRow")               return handleEscalSaveRow(e, emailSheet);
+    if (action === "escalAddRow")                return handleAddRow(e, emailSheet);
+    if (action === "escalDeleteRow")             return handleEscalDeleteRow(e, emailSheet);
+    if (action === "escalSaveIntervals")         return handleEscalSaveIntervals(e, emailSheet);
+    if (action === "saveAlertRemark")            return handleSaveAlertRemark(e, alertSheet);
+    if (action === "getHysteresis")              return handleGetHysteresis(threshSheet);
+    if (action === "saveHysteresis")             return handleSaveHysteresis(e, threshSheet);
+    if (action === "getSheetList")               return handleGetSheetList(ss);
+    if (action === "backupAllToDrive")           return handleBackupAllToDrive(ss);
+    if (action === "cleanupAlertHistorySheets")  return handleCleanupAlertHistorySheets(ss);
+
+    // Dashboard dynamic configuration provision
+    if (action === "getMetadata") {
+      var dryers = [];
+      for (var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++) {
+        dryers.push(d);
+      }
+      return jsonResponse({
+        firstDryer: FIRST_DRYER,
+        numDryers: NUM_DRYERS,
+        dryers: dryers,
+        numChambers: NUM_CHAMBERS,
+        totalChannels: TOTAL_CHANNELS
+      });
+    }
+
+    return handleRead(e, ss, dataSheet, statusSheet, threshSheet);
+  } catch (err) {
+    Logger.log("doGet error: " + err.toString());
+    return jsonResponse({ error: err.toString() });
+  }
+}
+
+function handleCleanupAlertHistorySheets(ss) {
+  try {
+    var deleted = deleteAlertHistorySnapshotSheets();
+    return jsonResponse({ ok: true, deleted: deleted, message: "Deleted " + deleted + " Alert History snapshot sheet(s)." });
+  } catch(e) {
+    return jsonResponse({ error: e.toString() });
+  }
+}
+
+function handleBackupAllToDrive(ss) {
+  try {
+    var sheets = ss.getSheets();
+    var backed = 0;
+    sheets.forEach(function(sh) {
+      var nm = sh.getName();
+      if (!isDateSheet(nm)) return;
+      var parts = nm.split(' ');
+      var day   = parseInt(parts[0]);
+      var mon   = MONTH_NAMES.indexOf(parts[1]);
+      var yr    = parseInt(parts[2]);
+      if (isNaN(day) || mon === -1 || isNaN(yr)) return;
+      backupSheetToDrive(sh, nm, new Date(yr, mon, day));
+      backed++;
+    });
+    backupConfigSheetsToDrive();
+    return jsonResponse({ ok: true, backedUp: backed });
+  } catch(e) {
+    return jsonResponse({ error: e.toString() });
+  }
+}
+
+function handleGetHysteresis(threshSheet) {
+  ensureThresholdHeaders(threshSheet);
+  ensureHysteresisLabels(threshSheet);
+  var hys = readHysteresis(threshSheet);
+  return jsonResponse({ upper: hys.upper, lower: hys.lower });
+}
+
+function handleSaveHysteresis(e, threshSheet) {
+  ensureThresholdHeaders(threshSheet);
+  ensureHysteresisLabels(threshSheet);
+  var upper = parseFloat(e.parameter.upper);
+  var lower = parseFloat(e.parameter.lower);
+  if (isNaN(upper)) return jsonResponse({ error: "Invalid upper hysteresis value" });
+  if (isNaN(lower)) return jsonResponse({ error: "Invalid lower hysteresis value" });
+  threshSheet.getRange("B6").setValue(upper);
+  threshSheet.getRange("B7").setValue(lower);
+  Logger.log("Hysteresis saved — upper: " + upper + ", lower: " + lower);
+  return jsonResponse({ ok: true, upper: upper, lower: lower });
+}
+
+function handleSaveAlertRemark(e, alertSheet) {
+  var dryer     = parseInt(e.parameter.dryer);
+  var chamber   = parseInt(e.parameter.chamber);
+  var startTime = (e.parameter.startTime || "").toString().trim();
+  var remark    = (e.parameter.remark    || "").toString().trim();
+
+  if (!dryer || !chamber || !startTime) {
+    return jsonResponse({ error: "dryer, chamber, and startTime are required" });
+  }
+
+  ensureAlertHistoryHeaders(alertSheet);
+  var lastRow = alertSheet.getLastRow();
+  if (lastRow < 2) return jsonResponse({ error: "No alert rows found" });
+
+  var data = alertSheet.getRange(2, 1, lastRow - 1, 11).getValues();
+  for (var i = data.length - 1; i >= 0; i--) {
+    if (parseInt(data[i][0]) === dryer &&
+        parseInt(data[i][1]) === chamber &&
+        data[i][2].toString().trim() === startTime) {
+      alertSheet.getRange(i + 2, 11).setValue(remark);
+      Logger.log("saveAlertRemark: updated row " + (i + 2) + " with remark: " + remark);
+      return jsonResponse({ ok: true, row: i + 2 });
+    }
+  }
+  return jsonResponse({ error: "Alert row not found for given dryer/chamber/startTime" });
+}
+
+function handleGetAlertHistory(e, alertSheet, threshSheet) {
+  ensureAlertHistoryHeaders(alertSheet);
+
+  var now = new Date();
+  var startDate, endDate;
+
+  if (e.parameter && e.parameter.start && e.parameter.end) {
+    startDate = parseSheetTimestamp(e.parameter.start);
+    endDate   = parseSheetTimestamp(e.parameter.end);
+  } else {
+    endDate   = now;
+    startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  }
+
+  if (!startDate || !endDate) return jsonResponse({ error: "Invalid date range" });
+
+  var numRows = alertSheet.getLastRow();
+  if (numRows < 2) return jsonResponse({ alerts: [] });
+
+  var data   = alertSheet.getRange(2, 1, numRows - 1, 11).getValues();
+  var alerts = [];
+
+  data.forEach(function(row) {
+    var startTs    = parseSheetTimestamp(row[2].toString());
+    var endTimeStr = row[3].toString();
+    var endTs      = (endTimeStr && endTimeStr !== "Not Resolved") ? parseSheetTimestamp(endTimeStr) : null;
+    if (!startTs) return;
+    var eventEnd = endTs || now;
+    if (eventEnd < startDate || startTs > endDate) return;
+
+    alerts.push({
+      dryer:           parseInt(row[0]),
+      chamber:         parseInt(row[1]),
+      startTime:       row[2].toString(),
+      endTime:         endTimeStr || null,
+      peakTemp:        parseFloat(row[4]) || 0,
+      threshold:       parseFloat(row[5]) || 80,
+      overBy:          parseFloat(row[6]) || 0,
+      durationSeconds: parseInt(row[7])   || 0,
+      status:          row[8].toString(),
+      alertType:       row[9] ? row[9].toString() : "HIGH",
+      remarks:         row[10] ? row[10].toString() : ""
+    });
+  });
+
+  alerts.sort(function(a, b) {
+    return ((parseSheetTimestamp(b.startTime) || 0) - (parseSheetTimestamp(a.startTime) || 0));
+  });
+
+  return jsonResponse({ alerts: alerts });
+}
+
+function ensureAlertHistoryHeaders(sheet) {
+  if (sheet.getLastRow() > 0) {
+    var kHeader = sheet.getRange(1, 11).getValue();
+    if (!kHeader || kHeader.toString().trim() === "") {
+      sheet.getRange(1, 11).setValue("Remarks");
+      sheet.getRange(1, 11).setFontWeight("bold");
+    }
+    return;
+  }
+  var headers = ["Dryer","Chamber","StartTime","EndTime",
+                 "PeakTemp","Threshold","OverBy","DurationSeconds","Status","AlertType","Remarks"];
+  sheet.appendRow(headers);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidth(3, 160);
+  sheet.setColumnWidth(4, 160);
+  sheet.setColumnWidth(11, 200);
+}
+
+function handleEscalGetContacts(emailSheet) {
+  ensureEmailHeaders(emailSheet);
+  var lastRow  = emailSheet.getLastRow();
+  var contacts = [];
+  if (lastRow >= 2) {
+    var data = emailSheet.getRange(2, 1, lastRow - 1, 3).getValues();
+    data.forEach(function(row) {
+      contacts.push({
+        l1: row[0] ? row[0].toString().trim() : "",
+        l2: row[1] ? row[1].toString().trim() : "",
+        l3: row[2] ? row[2].toString().trim() : ""
+      });
+    });
+  }
+  var l1Int = 5, l2Int = 10, l3Int = 30;
+  try {
+    var intData = emailSheet.getRange(2, 5, 1, 3).getValues()[0];
+    if (!isNaN(parseInt(intData[0])) && parseInt(intData[0]) > 0) l1Int = parseInt(intData[0]);
+    if (!isNaN(parseInt(intData[1])) && parseInt(intData[1]) > 0) l2Int = parseInt(intData[1]);
+    if (!isNaN(parseInt(intData[2])) && parseInt(intData[2]) > 0) l3Int = parseInt(intData[2]);
+  } catch(e) {}
+  return jsonResponse({ contacts: contacts, intervals: { l1: l1Int, l2: l2Int, l3: l3Int } });
+}
+
+function handleEscalSaveRow(e, emailSheet) {
+  ensureEmailHeaders(emailSheet);
+  var rowIndex = parseInt(e.parameter.rowIndex);
+  var lastRow  = emailSheet.getLastRow();
+  if (isNaN(rowIndex) || rowIndex < 2 || rowIndex > lastRow) return jsonResponse({ error: "Invalid rowIndex: " + rowIndex });
+  var l1 = (e.parameter.l1 || "").toString().trim();
+  var l2 = (e.parameter.l2 || "").toString().trim();
+  var l3 = (e.parameter.l3 || "").toString().trim();
+  if (l1 && !validateEmail(l1)) return jsonResponse({ error: "Invalid Level-1 email: " + l1 });
+  if (l2 && !validateEmail(l2)) return jsonResponse({ error: "Invalid Level-2 email: " + l2 });
+  if (l3 && !validateEmail(l3)) return jsonResponse({ error: "Invalid Level-3 email: " + l3 });
+  emailSheet.getRange(rowIndex, 1, 1, 3).setValues([[l1, l2, l3]]);
+  return jsonResponse({ ok: true, rowIndex: rowIndex });
+}
+
+function handleAddRow(e, emailSheet) {
+  ensureEmailHeaders(emailSheet);
+  var l1 = (e.parameter.l1 || "").toString().trim();
+  var l2 = (e.parameter.l2 || "").toString().trim();
+  var l3 = (e.parameter.l3 || "").toString().trim();
+  if (!l1 && !l2 && !l3) return jsonResponse({ error: "All fields are empty — nothing to add." });
+  if (l1 && !validateEmail(l1)) return jsonResponse({ error: "Invalid Level-1 email: " + l1 });
+  if (l2 && !validateEmail(l2)) return jsonResponse({ error: "Invalid Level-2 email: " + l2 });
+  if (l3 && !validateEmail(l3)) return jsonResponse({ error: "Invalid Level-3 email: " + l3 });
+  emailSheet.appendRow([l1, l2, l3]);
+  return jsonResponse({ ok: true, newRow: emailSheet.getLastRow() });
+}
+
+function handleEscalDeleteRow(e, emailSheet) {
+  ensureEmailHeaders(emailSheet);
+  var rowIndex = parseInt(e.parameter.rowIndex);
+  var lastRow  = emailSheet.getLastRow();
+  if (isNaN(rowIndex) || rowIndex < 2 || rowIndex > lastRow) return jsonResponse({ error: "Invalid rowIndex: " + rowIndex });
+  emailSheet.deleteRow(rowIndex);
+  return jsonResponse({ ok: true, deletedRow: rowIndex });
+}
+
+function handleEscalSaveIntervals(e, emailSheet) {
+  ensureEmailHeaders(emailSheet);
+  var l1 = parseInt(e.parameter.l1);
+  var l2 = parseInt(e.parameter.l2);
+  var l3 = parseInt(e.parameter.l3);
+  if (isNaN(l1)||l1<1) return jsonResponse({ error: "Invalid Level-1 interval" });
+  if (isNaN(l2)||l2<1) return jsonResponse({ error: "Invalid Level-2 interval" });
+  if (isNaN(l3)||l3<1) return jsonResponse({ error: "Invalid Level-3 interval" });
+  if (emailSheet.getLastRow() < 2) emailSheet.appendRow(["","","","",l1,l2,l3]);
+  else emailSheet.getRange(2, 5, 1, 3).setValues([[l1, l2, l3]]);
+  return jsonResponse({ ok: true, l1: l1, l2: l2, l3: l3 });
+}
+
+function handleGetStatusTimeout(statusSheet) {
+  var timeout     = getStatusTimeout(statusSheet);
+  var mergeWindow = getMergeWindow(statusSheet);
+  return jsonResponse({ timeoutSeconds: timeout, mergeWindowSeconds: mergeWindow });
+}
+
+function getStatusTimeout(statusSheet) {
+  try {
+    var val = statusSheet.getRange("P2").getValue();
+    var num = parseInt(val);
+    if (!isNaN(num) && num >= 10 && num <= 3600) return num;
+  } catch(e) {}
+  return DEFAULT_STATUS_TIMEOUT;
+}
+
+function getMergeWindow(statusSheet) {
+  try {
+    var val = statusSheet.getRange("Q2").getValue();
+    var num = parseInt(val);
+    if (!isNaN(num) && num >= 5 && num <= 3600) return num;
+  } catch(e) {}
+  return DEFAULT_MERGE_WINDOW;
+}
+
+function handleWrite(e, ss, dataSheet, threshSheet, statusSheet, emailSheet, alertSheet) {
+  var dryer = parseInt(e.parameter.dryer) || 0;
+  if (dryer < FIRST_DRYER || dryer >= FIRST_DRYER + NUM_DRYERS) {
+    return jsonResponse({ error: "Invalid dryer ID: " + dryer + " (valid: " + FIRST_DRYER + "-" + (FIRST_DRYER + NUM_DRYERS - 1) + ")" });
+  }
+
+  // Serialize concurrent write requests so that the first dryer's row is
+  // committed before the second dryer's request tries to merge into it.
+  // Without this lock, two near-simultaneous GAS executions both saw an
+  // empty last row and each appended their own row → duplicate rows in sheet.
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000); // wait up to 10 s for any concurrent write to finish
+  } catch (lockErr) {
+    Logger.log("handleWrite: could not acquire lock: " + lockErr.toString());
+    return jsonResponse({ error: "Server busy, please retry" });
+  }
+
+  var temps = [];
+  for (var c = 1; c <= NUM_CHAMBERS; c++) {
+    var val = parseFloat(e.parameter["t" + c]);
+    temps.push(isNaN(val) ? 0 : val);
+  }
+
+  var tz  = Session.getScriptTimeZone();
+  var now = new Date();
+  var ts  = Utilities.formatDate(now, tz, "dd/MM/yyyy HH:mm:ss");
+  var mergeWindowSec = getMergeWindow(statusSheet);
+
+  ensureDataHeaders(dataSheet);
+
+  var statusLatest = {};
+  try {
+    var sLastRow = statusSheet.getLastRow();
+    if (sLastRow >= 2) {
+      var sData = statusSheet.getRange(2, 1, sLastRow - 1, 3 + NUM_CHAMBERS).getValues();
+      for (var si = 0; si < sData.length; si++) {
+        var sDryer = parseInt(sData[si][0]);
+        if (!sDryer || sDryer < FIRST_DRYER || sDryer >= FIRST_DRYER + NUM_DRYERS) continue;
+        var dTemps = [];
+        for (var sc = 0; sc < NUM_CHAMBERS; sc++) {
+          dTemps.push(parseFloat(sData[si][3 + sc]) || 0);
+        }
+        statusLatest[sDryer] = dTemps;
+      }
+    }
+  } catch(statusErr) {
+    Logger.log("handleWrite: could not read status sheet: " + statusErr.toString());
+  }
+
+  var lastRow = dataSheet.getLastRow();
+  var shouldMerge = false, targetRow = -1;
+
+  if (lastRow >= 2) {
+    var lastData = dataSheet.getRange(lastRow, 1, 1, TOTAL_CHANNELS + 1).getValues()[0];
+    var lastTimestamp = parseSheetTimestamp(lastData[0].toString());
+    if (lastTimestamp) {
+      var diffSeconds = (now - lastTimestamp) / 1000;
+      if (Math.abs(diffSeconds) <= mergeWindowSec) {
+        shouldMerge = true;
+        targetRow = lastRow;
+      }
+    }
+  }
+
+  var offset = (dryer - FIRST_DRYER) * NUM_CHAMBERS;
+
+  if (shouldMerge && targetRow > 0) {
+    dataSheet.getRange(targetRow, offset + 2, 1, NUM_CHAMBERS).setValues([temps]);
+    dataSheet.getRange(targetRow, 1).setValue(ts);
+  } else {
+    var row = new Array(TOTAL_CHANNELS + 1).fill(0);
+    row[0] = ts;
+
+    for (var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++) {
+      var dOffset = (d - FIRST_DRYER) * NUM_CHAMBERS;
+      if (d === dryer) {
+        for (var ci = 0; ci < NUM_CHAMBERS; ci++) {
+          row[dOffset + 1 + ci] = temps[ci];
+        }
+      } else {
+        if (statusLatest[d]) {
+          for (var ci2 = 0; ci2 < NUM_CHAMBERS; ci2++) {
+            row[dOffset + 1 + ci2] = statusLatest[d][ci2];
+          }
+        }
+      }
+    }
+
+    dataSheet.appendRow(row);
+  }
+
+  updateStatus(statusSheet, dryer, temps, now);
+
+  var totalRows = dataSheet.getLastRow();
+  if (totalRows > 10001) dataSheet.deleteRows(2, totalRows - 10001);
+
+  lock.releaseLock();
+  return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+}
+
+// =========================================================
+// handleWriteAll — single request carries all dryers' data
+// URL params: d5t1..d5t8, d6t1..d6t8
+// Writes exactly ONE row per call — no merge needed, no race.
+// =========================================================
+function handleWriteAll(e, ss, dataSheet, threshSheet, statusSheet, emailSheet, alertSheet) {
+  var tz  = Session.getScriptTimeZone();
+  var now = new Date();
+  var ts  = Utilities.formatDate(now, tz, "dd/MM/yyyy HH:mm:ss");
+
+  ensureDataHeaders(dataSheet);
+
+  var row = new Array(TOTAL_CHANNELS + 1).fill(0);
+  row[0] = ts;
+
+  for (var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++) {
+    var offset = (d - FIRST_DRYER) * NUM_CHAMBERS;
+    var temps  = [];
+    for (var c = 1; c <= NUM_CHAMBERS; c++) {
+      var key = "d" + d + "t" + c;
+      var val = parseFloat(e.parameter[key]);
+      var v   = isNaN(val) ? 0 : val;
+      row[offset + c] = v;
+      temps.push(v);
+    }
+    updateStatus(statusSheet, d, temps, now);
+  }
+
+  dataSheet.appendRow(row);
+
+  var totalRows = dataSheet.getLastRow();
+  if (totalRows > 10001) dataSheet.deleteRows(2, totalRows - 10001);
+
+  Logger.log("handleWriteAll: wrote 1 row for all " + NUM_DRYERS + " dryers at " + ts);
+  return ContentService.createTextOutput("OK").setMimeType(ContentService.MimeType.TEXT);
+}
+
+function handleRead(e, ss, dataSheet, statusSheet, threshSheet) {
+  var now2 = new Date();
+  var startDate, endDate;
+  if (e.parameter && e.parameter.start && e.parameter.end) {
+    startDate = parseSheetTimestamp(e.parameter.start);
+    endDate   = parseSheetTimestamp(e.parameter.end);
+  } else {
+    endDate   = now2;
+    startDate = new Date(now2.getTime() - 24 * 60 * 60 * 1000);
+  }
+
+  var todayMidnight = new Date(now2.getFullYear(), now2.getMonth(), now2.getDate(), 0, 0, 0);
+  var onlyTodaySheet = (startDate && endDate && startDate >= todayMidnight && endDate <= now2);
+
+  var sheetNames;
+  if (onlyTodaySheet) {
+    sheetNames = ['Sheet1'];
+  } else {
+    sheetNames = getRelevantSheetNames(ss, startDate, endDate);
+  }
+
+  var result = [], headerAdded = false;
+  for (var si = 0; si < sheetNames.length; si++) {
+    var sh = ss.getSheetByName(sheetNames[si]);
+    if (!sh) continue;
+    var numRows = sh.getLastRow();
+    if (numRows < 2) continue;
+    var data = sh.getDataRange().getValues();
+    if (!headerAdded) { result.push(data[0]); headerAdded = true; }
+    for (var i = 1; i < numRows; i++) {
+      var rowTs = parseSheetTimestamp(data[i][0].toString());
+      if (!rowTs) continue;
+      if (rowTs >= startDate && rowTs <= endDate) result.push(data[i]);
+    }
+  }
+  return jsonResponse({
+    firstDryer: FIRST_DRYER,
+    numDryers: NUM_DRYERS,
+    values: result,
+    statusInfo: buildStatusResponse(statusSheet),
+    thresholds: readThresholds(threshSheet)
+  });
+}
+
+function getRelevantSheetNames(ss, startDate, endDate) {
+  var names = ['Sheet1'];
+  if (!startDate || !endDate) return getAllDataSheetNames(ss);
+  var startDay = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate());
+  var endDay   = new Date(endDate.getFullYear(),   endDate.getMonth(),   endDate.getDate());
+  ss.getSheets().forEach(function(s) {
+    var nm = s.getName();
+    if (nm === 'Sheet1' || !isDateSheet(nm)) return;
+    var parts = nm.split(' ');
+    var day   = parseInt(parts[0]);
+    var mon   = MONTH_NAMES.indexOf(parts[1]);
+    var yr    = parseInt(parts[2]);
+    if (isNaN(day) || mon === -1 || isNaN(yr)) return;
+    var sheetDay = new Date(yr, mon, day);
+    if (sheetDay >= startDay && sheetDay <= endDay) names.push(nm);
+  });
+  return names;
+}
+
+function handleSetThreshold(e, threshSheet) {
+  ensureThresholdHeaders(threshSheet);
+  if (e.parameter.thresholds) {
+    var obj = JSON.parse(e.parameter.thresholds);
+    threshSheet.getRange(2, 2, 1, TOTAL_CHANNELS).setValues([buildThresholdRow(obj, 80)]);
+    return jsonResponse({ ok: true, source: "bulk" });
+  }
+  if (e.parameter.dryer && e.parameter.chamber && e.parameter.value !== undefined) {
+    var dryer = parseInt(e.parameter.dryer), chamber = parseInt(e.parameter.chamber), value = parseFloat(e.parameter.value);
+    if (dryer < FIRST_DRYER || dryer >= FIRST_DRYER + NUM_DRYERS || chamber < 1 || chamber > NUM_CHAMBERS) {
+      return jsonResponse({ error: "Invalid dryer/chamber" });
+    }
+    if (isNaN(value)||value<0||value>999) return jsonResponse({ error: "Invalid threshold value" });
+    threshSheet.getRange(2, (dryer - FIRST_DRYER) * NUM_CHAMBERS + chamber + 1).setValue(value);
+    return jsonResponse({ ok: true, dryer: dryer, chamber: chamber, value: value });
+  }
+  return jsonResponse({ error: "Invalid threshold parameters" });
+}
+
+function handleSetLowerThreshold(e, threshSheet) {
+  ensureThresholdHeaders(threshSheet);
+  if (e.parameter.thresholds) {
+    var obj = JSON.parse(e.parameter.thresholds);
+    threshSheet.getRange(3, 2, 1, TOTAL_CHANNELS).setValues([buildThresholdRow(obj, DEFAULT_LOWER_THRESHOLD)]);
+    return jsonResponse({ ok: true, source: "bulk" });
+  }
+  if (e.parameter.dryer && e.parameter.chamber && e.parameter.value !== undefined) {
+    var dryer = parseInt(e.parameter.dryer), chamber = parseInt(e.parameter.chamber), value = parseFloat(e.parameter.value);
+    if (dryer < FIRST_DRYER || dryer >= FIRST_DRYER + NUM_DRYERS || chamber < 1 || chamber > NUM_CHAMBERS) {
+      return jsonResponse({ error: "Invalid dryer/chamber" });
+    }
+    if (isNaN(value)||value<-300||value>999) return jsonResponse({ error: "Invalid lower threshold value" });
+    threshSheet.getRange(3, (dryer - FIRST_DRYER) * NUM_CHAMBERS + chamber + 1).setValue(value);
+    return jsonResponse({ ok: true, dryer: dryer, chamber: chamber, value: value });
+  }
+  return jsonResponse({ error: "Invalid lower threshold parameters" });
+}
+
+function handleGetThresholds(threshSheet) {
+  ensureThresholdHeaders(threshSheet);
+  return jsonResponse({ thresholds: readThresholds(threshSheet), lowerThresholds: readLowerThresholds(threshSheet) });
+}
+
+function handleGetLowerThresholdsAction(threshSheet) {
+  ensureThresholdHeaders(threshSheet);
+  return jsonResponse({ lowerThresholds: readLowerThresholds(threshSheet) });
+}
+
+function handleGetStatus(statusSheet) {
+  return jsonResponse({ statusInfo: buildStatusResponse(statusSheet) });
+}
+
+function updateStatus(statusSheet, dryer, temps, now) {
+  ensureStatusHeaders(statusSheet);
+  var numRows = statusSheet.getLastRow();
+  var dryerRow = -1;
+  if (numRows >= 2) {
+    var data = statusSheet.getRange(2, 1, numRows - 1, 1).getValues();
+    for (var i = 0; i < data.length; i++) {
+      if (parseInt(data[i][0]) === dryer) { dryerRow = i + 2; break; }
+    }
+  }
+  var tz = Session.getScriptTimeZone();
+  var ts = Utilities.formatDate(now, tz, "dd/MM/yyyy HH:mm:ss");
+  var rowData = [dryer, "ONLINE", ts].concat(temps);
+  if (dryerRow === -1) statusSheet.appendRow(rowData);
+  else statusSheet.getRange(dryerRow, 1, 1, rowData.length).setValues([rowData]);
+}
+
+function buildStatusResponse(statusSheet) {
+  ensureStatusHeaders(statusSheet);
+  var result = {}, numRows = statusSheet.getLastRow();
+  if (numRows < 2) return result;
+  var timeout = getStatusTimeout(statusSheet), now = new Date();
+  var data = statusSheet.getRange(2, 1, numRows - 1, 3 + NUM_CHAMBERS).getValues();
+  var mcuOnline = false;
+  data.forEach(function(row) {
+    var dryer = parseInt(row[0]);
+    if (!dryer || dryer < FIRST_DRYER || dryer >= FIRST_DRYER + NUM_DRYERS) return;
+    var lastSeen = parseSheetTimestamp(row[2].toString());
+    if (lastSeen && (now - lastSeen)/1000 <= timeout) mcuOnline = true;
+  });
+  data.forEach(function(row) {
+    var dryer = parseInt(row[0]);
+    if (!dryer || dryer < FIRST_DRYER || dryer >= FIRST_DRYER + NUM_DRYERS) return;
+    var lastSeenStr = row[2].toString(), lastSeen = parseSheetTimestamp(lastSeenStr), status;
+    if (!mcuOnline) { status = "UNKNOWN"; }
+    else if (!lastSeen) { status = "UNKNOWN"; }
+    else {
+      var diffSec = (now - lastSeen) / 1000;
+      if (diffSec <= timeout) {
+        var allZero = true;
+        for (var c=0;c<NUM_CHAMBERS;c++) { if (parseFloat(row[3+c])!==0){allZero=false;break;} }
+        status = allZero ? "OFFLINE" : "ONLINE";
+      } else { status = "OFFLINE"; }
+    }
+    var temps = {};
+    for (var c=0;c<NUM_CHAMBERS;c++) temps["C"+(c+1)] = row[3+c];
+    result["D"+dryer] = { status: status, lastSeen: lastSeenStr, temps: temps };
+  });
+  return result;
+}
+
+function readThresholds(threshSheet) {
+  var result = {};
+  var numRows = threshSheet.getLastRow();
+  if (numRows < 2) {
+    for (var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++) { result["D"+d]={};for(var c=1;c<=NUM_CHAMBERS;c++) result["D"+d]["C"+c]=80; }
+    return result;
+  }
+  var data = threshSheet.getRange(2,2,1,TOTAL_CHANNELS).getValues()[0];
+  for (var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++) { result["D"+d]={};for(var c=1;c<=NUM_CHAMBERS;c++){var idx=(d-FIRST_DRYER)*NUM_CHAMBERS+(c-1),val=parseFloat(data[idx]);result["D"+d]["C"+c]=isNaN(val)?80:val;} }
+  return result;
+}
+
+function readLowerThresholds(threshSheet) {
+  var result = {};
+  var numRows = threshSheet.getLastRow();
+  if (numRows < 3) {
+    for (var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++){result["D"+d]={};for(var c=1;c<=NUM_CHAMBERS;c++)result["D"+d]["C"+c]=DEFAULT_LOWER_THRESHOLD;}
+    return result;
+  }
+  var data = threshSheet.getRange(3,2,1,TOTAL_CHANNELS).getValues()[0];
+  for (var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++){result["D"+d]={};for(var c=1;c<=NUM_CHAMBERS;c++){var idx=(d-FIRST_DRYER)*NUM_CHAMBERS+(c-1),val=parseFloat(data[idx]);result["D"+d]["C"+c]=isNaN(val)?DEFAULT_LOWER_THRESHOLD:val;}}
+  return result;
+}
+
+function buildThresholdRow(obj, defaultVal) {
+  var row = [];
+  for (var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++) for (var c=1;c<=NUM_CHAMBERS;c++) {
+    var key="D"+d+"C"+c; row.push(obj[key]!==undefined?parseFloat(obj[key]):defaultVal);
+  }
+  return row;
+}
+
+function handleGetAvailability(e, ss, dataSheet) {
+  try {
+    var now = new Date(), startDate, endDate;
+    if (e.parameter&&e.parameter.start&&e.parameter.end) {
+      startDate=parseSheetTimestamp(e.parameter.start); endDate=parseSheetTimestamp(e.parameter.end);
+    } else { endDate=now; startDate=new Date(now.getTime()-24*60*60*1000); }
+    if (!startDate||!endDate) return jsonResponse({ error: "Invalid date range" });
+
+    var sheetNames = getAllDataSheetNames(ss);
+
+    var rawRows=[];
+    for (var si=0;si<sheetNames.length;si++) {
+      var sh=ss.getSheetByName(sheetNames[si]);
+      if(!sh||sh.getLastRow()<2) continue;
+      var numRows=sh.getLastRow(), allData=sh.getRange(2,1,numRows-1,TOTAL_CHANNELS+1).getValues();
+      for(var i=0;i<allData.length;i++){var rowTs=parseSheetTimestamp(allData[i][0].toString());if(!rowTs)continue;if(rowTs>=new Date(startDate.getTime()-5*60*1000)&&rowTs<=new Date(endDate.getTime()+5*60*1000))rawRows.push({ts:rowTs,row:allData[i]});}
+    }
+    rawRows.sort(function(a,b){return a.ts-b.ts;});
+    var totalRangeSec=Math.round((endDate-startDate)/1000),mcuGaps=[],mcuOfflineSec=0;
+    for(var i=1;i<rawRows.length;i++){var gapSec=(rawRows[i].ts-rawRows[i-1].ts)/1000;if(gapSec>MCU_OFF_THRESHOLD_SECONDS){var gapStart=rawRows[i-1].ts,gapEnd=rawRows[i].ts,effectiveStart=gapStart<startDate?startDate:gapStart,effectiveEnd=gapEnd>endDate?endDate:gapEnd,effectiveSec=Math.round((effectiveEnd-effectiveStart)/1000);if(effectiveSec>0){mcuOfflineSec+=effectiveSec;mcuGaps.push({startTime:formatTsForOutput(gapStart),endTime:formatTsForOutput(gapEnd),gapSeconds:Math.round(gapSec),remark:"MCU was offline - all dryer states are unknown during this period"});}}}
+    var mcuOnlineSec=Math.max(0,totalRangeSec-mcuOfflineSec),dryerStats={},dryerOffPeriods={};
+    for(var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++){var dKey="D"+d,offset=1+(d-FIRST_DRYER)*NUM_CHAMBERS,inOff=false,offStartTs=null,offStartStr=null,periods=[];
+      for(var ri=0;ri<rawRows.length;ri++){var rowObj=rawRows[ri],rowTs2=rowObj.ts;
+        if(rowTs2<startDate||rowTs2>endDate){if(!inOff&&rowTs2<startDate){var allZ2=true;for(var c2=0;c2<NUM_CHAMBERS;c2++){if(parseFloat(rowObj.row[offset+c2])!==0){allZ2=false;break;}}if(allZ2){inOff=true;offStartTs=startDate;offStartStr=formatTsForOutput(startDate);}}continue;}
+        var allZero=true;for(var ch=0;ch<NUM_CHAMBERS;ch++){var v=parseFloat(rowObj.row[offset+ch]);if(!isNaN(v)&&v!==0){allZero=false;break;}}
+        if(allZero){if(!inOff){inOff=true;offStartTs=rowTs2;offStartStr=formatTsForOutput(rowTs2);}}
+        else{if(inOff){var dur=Math.round((rowTs2-offStartTs)/1000);if(dur>=MIN_DRYER_OFF_SECONDS){var remark=getOverlapRemark(offStartTs,rowTs2,mcuGaps);periods.push({startTime:offStartStr,endTime:formatTsForOutput(rowTs2),durationSeconds:Math.max(0,dur),remark:remark});}inOff=false;}}
+      }
+      if(inOff){var closeTs=endDate,dur2=Math.round((closeTs-offStartTs)/1000);if(dur2>=MIN_DRYER_OFF_SECONDS){var remark2=getOverlapRemark(offStartTs,closeTs,mcuGaps);if(!remark2){var lastGap=mcuGaps.length>0?mcuGaps[mcuGaps.length-1]:null;if(lastGap){var lgEnd=parseSheetTimestamp(lastGap.endTime);if(lgEnd&&lgEnd>=closeTs)remark2="MCU went offline before dryer resumed - end state is uncertain";}}periods.push({startTime:offStartStr,endTime:null,durationSeconds:Math.max(0,dur2),remark:remark2||"Dryer still offline at end of selected range"});}}
+      var dryerOffSec=0,unknownSec=0;
+      periods.forEach(function(p){dryerOffSec+=p.durationSeconds||0;if(p.remark&&p.remark.indexOf("MCU")!==-1){var pStart=parseSheetTimestamp(p.startTime),pEnd=p.endTime?parseSheetTimestamp(p.endTime):endDate;if(pStart&&pEnd){mcuGaps.forEach(function(g){var gS=parseSheetTimestamp(g.startTime),gE=parseSheetTimestamp(g.endTime);if(gS&&gE){var os=gS>pStart?gS:pStart,oe=gE<pEnd?gE:pEnd;if(oe>os)unknownSec+=Math.round((oe-os)/1000);}});}}});
+      dryerOffPeriods[dKey]=periods;
+      dryerStats[dKey]={offSeconds:dryerOffSec,onSeconds:Math.max(0,totalRangeSec-dryerOffSec-mcuOfflineSec),unknownSeconds:mcuOfflineSec,offEvents:periods.length};
+    }
+    return jsonResponse({rangeStart:formatTsForOutput(startDate),rangeEnd:formatTsForOutput(endDate),totalRangeSeconds:totalRangeSec,mcu:{onlineSeconds:mcuOnlineSec,offlineSeconds:mcuOfflineSec,offlineEvents:mcuGaps.length},mcuGaps:mcuGaps,dryerStats:dryerStats,dryerOffPeriods:dryerOffPeriods});
+  } catch(err) { Logger.log("ERROR in handleGetAvailability: "+err.toString()); return jsonResponse({error:err.toString()}); }
+}
+
+function getOverlapRemark(offStartTs,offEndTs,mcuGaps){for(var i=0;i<mcuGaps.length;i++){var g=mcuGaps[i],gS=parseSheetTimestamp(g.startTime),gE=parseSheetTimestamp(g.endTime);if(!gS||!gE)continue;if(gS<offEndTs&&gE>offStartTs)return "MCU was offline during part of this period - dryer state is uncertain";}return null;}
+function formatTsForOutput(d){if(!d)return "";var tz=Session.getScriptTimeZone();return Utilities.formatDate(d,tz,"dd/MM/yyyy HH:mm:ss");}
+function autoGenerateAvailabilitySheets(){try{var ss=SpreadsheetApp.getActiveSpreadsheet(),dataSheet=getOrCreateSheet(ss,"Sheet1");handleGenerateAvailabilitySheets(ss,dataSheet);Logger.log("autoGenerateAvailabilitySheets: completed.");}catch(err){Logger.log("autoGenerateAvailabilitySheets error: "+err.toString());}}
+
+function handleGenerateAvailabilitySheets(ss, dataSheet) {
+  try {
+    var sheetNames = getAllDataSheetNames(ss);
+    var startDate=null,endDate=null;
+    for(var si=0;si<sheetNames.length;si++){var sh=ss.getSheetByName(sheetNames[si]);if(!sh||sh.getLastRow()<2)continue;var numRows=sh.getLastRow(),allData=sh.getRange(2,1,numRows-1,1).getValues();for(var i=0;i<allData.length;i++){var ts=parseSheetTimestamp(allData[i][0].toString());if(!ts)continue;if(!startDate||ts<startDate)startDate=ts;if(!endDate||ts>endDate)endDate=ts;}}
+    if(!startDate)return jsonResponse({message:"No valid timestamps found",rows:0});
+    var fakeE={parameter:{start:formatTsForOutput(startDate),end:formatTsForOutput(endDate)}};
+    var result=JSON.parse(handleGetAvailability(fakeE,ss,dataSheet).getContent());
+    if(result.error)return jsonResponse({error:result.error});
+    var mcuSheet=getOrCreateSheet(ss,"MCU Availability");mcuSheet.clearContents();
+    var mcuHeaders=["Offline Start","Offline End","Duration (seconds)","Duration (readable)","Remark"];mcuSheet.appendRow(mcuHeaders);mcuSheet.getRange(1,1,1,mcuHeaders.length).setFontWeight("bold");
+    (result.mcuGaps||[]).forEach(function(g){mcuSheet.appendRow([g.startTime,g.endTime,g.gapSeconds,formatDurationGas(g.gapSeconds),g.remark]);});
+    var dryerSheet=getOrCreateSheet(ss,"Dryer Availability");dryerSheet.clearContents();
+    var dryerHeaders=["Dryer","Off Start","Off End","Duration (seconds)","Duration (readable)","Remark"];dryerSheet.appendRow(dryerHeaders);dryerSheet.getRange(1,1,1,dryerHeaders.length).setFontWeight("bold");
+    for(var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++){var dKey="D"+d,periods=result.dryerOffPeriods[dKey]||[];periods.forEach(function(p){if((p.durationSeconds||0)<MIN_DRYER_OFF_SECONDS)return;dryerSheet.appendRow(["Dryer "+d,p.startTime,p.endTime||"(still offline)",p.durationSeconds,formatDurationGas(p.durationSeconds),p.remark||""]);});}
+    return jsonResponse({message:"Availability sheets generated"});
+  } catch(err){Logger.log("ERROR in handleGenerateAvailabilitySheets: "+err.toString());return jsonResponse({error:err.toString()});}
+}
+
+function formatDurationGas(seconds){if(!seconds||seconds<=0)return "< 1 min";var h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=Math.floor(seconds%60);if(h>0)return h+"h "+m+"m";if(m>0)return m+"m "+s+"s";return s+"s";}
+
+function handleGenerateAlerts(ss, dataSheet, threshSheet, alertSheet) {
+  try {
+    alertSheet.clearContents(); ensureAlertHistoryHeaders(alertSheet);
+    ensureThresholdHeaders(threshSheet);
+    var thresholds=readThresholds(threshSheet),lowerThresholds=readLowerThresholds(threshSheet);
+    var hys = readHysteresis(threshSheet);
+    var lastRow=dataSheet.getLastRow();if(lastRow<2)return jsonResponse({message:"No data to process",alertsCreated:0});
+    var data=dataSheet.getRange(2,1,lastRow-1,TOTAL_CHANNELS+1).getValues(),active={},alertRows=[],tz=Session.getScriptTimeZone();
+    for(var i=0;i<data.length;i++){var row=data[i],rowTime=null;if(row[0])rowTime=(row[0]instanceof Date)?row[0]:parseSheetTimestamp(row[0].toString());if(!rowTime)continue;var timestamp=Utilities.formatDate(rowTime,tz,"dd/MM/yyyy HH:mm:ss"),isLastRow=(i===data.length-1);
+      for(var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++){for(var c=1;c<=NUM_CHAMBERS;c++){var colIndex=(d-FIRST_DRYER)*NUM_CHAMBERS+c,temp=parseFloat(row[colIndex]),keyH="D"+d+"C"+c+"_H",keyL="D"+d+"C"+c+"_L";
+        var upThresh=(thresholds["D"+d]?thresholds["D"+d]["C"+c]:DEFAULT_UPPER_THRESHOLD);
+        var loThresh=(lowerThresholds["D"+d]?lowerThresholds["D"+d]["C"+c]:DEFAULT_LOWER_THRESHOLD);
+        var effectiveUpperTrigger = upThresh + hys.upper;
+        var effectiveLowerTrigger = loThresh + hys.lower;
+        if(isNaN(temp)||temp===0){closeActiveAlert(active,alertRows,keyH,timestamp,rowTime);closeActiveAlert(active,alertRows,keyL,timestamp,rowTime);continue;}
+        if(!isNaN(upThresh)&&temp>effectiveUpperTrigger){var overBy=parseFloat((temp-upThresh).toFixed(2));if(!active[keyH])active[keyH]={dryer:d,chamber:c,startTime:timestamp,startTs:rowTime,peak:temp,thresh:upThresh,overBy:overBy,type:"HIGH"};else if(temp>active[keyH].peak){active[keyH].peak=temp;active[keyH].overBy=overBy;}if(isLastRow){var a=active[keyH];alertRows.push([a.dryer,a.chamber,a.startTime,"Not Resolved",a.peak,a.thresh,a.overBy,Math.round((rowTime-a.startTs)/1000),"ACTIVE","HIGH",""]);delete active[keyH];}}else closeActiveAlert(active,alertRows,keyH,timestamp,rowTime);
+        if(!isNaN(loThresh)&&loThresh>0&&temp<effectiveLowerTrigger){var underBy=parseFloat((loThresh-temp).toFixed(2));if(!active[keyL])active[keyL]={dryer:d,chamber:c,startTime:timestamp,startTs:rowTime,peak:temp,thresh:loThresh,overBy:-underBy,type:"LOW"};else if(temp<active[keyL].peak){active[keyL].peak=temp;active[keyL].overBy=-underBy;}if(isLastRow){var al=active[keyL];alertRows.push([al.dryer,al.chamber,al.startTime,"Not Resolved",al.peak,al.thresh,al.overBy,Math.round((rowTime-al.startTs)/1000),"ACTIVE","LOW",""]);delete active[keyL];}}else closeActiveAlert(active,alertRows,keyL,timestamp,rowTime);
+      }}
+    }
+    for(var remainKey in active){var ra=active[remainKey];alertRows.push([ra.dryer,ra.chamber,ra.startTime,"Not Resolved",ra.peak,ra.thresh,ra.overBy,0,"ACTIVE",ra.type,""]);}
+    if(alertRows.length>0)alertSheet.getRange(2,1,alertRows.length,11).setValues(alertRows);
+    return jsonResponse({message:"Alert history generated",alertsCreated:alertRows.length});
+  } catch(err){Logger.log("ERROR in handleGenerateAlerts: "+err.toString());return jsonResponse({error:err.toString()});}
+}
+
+function closeActiveAlert(active,alertRows,key,timestamp,rowTime){if(active[key]){var a=active[key],dur=Math.max(0,Math.round((rowTime-a.startTs)/1000));alertRows.push([a.dryer,a.chamber,a.startTime,timestamp,a.peak,a.thresh,a.overBy,dur,"RESOLVED",a.type,""]);delete active[key];}}
+
+function autoCheckAlerts(){
+  try{
+    var ss=SpreadsheetApp.getActiveSpreadsheet(),
+        dataSheet=getOrCreateSheet(ss,"Sheet1"),
+        threshSheet=getOrCreateSheet(ss,"Thresholds Sheet"),
+        alertSheet=getOrCreateSheet(ss,"Alert History"),
+        emailSheet=getOrCreateSheet(ss,"Email IDs"),
+        statusSheet=getOrCreateSheet(ss,"Status Sheet");
+    ensureAlertHistoryHeaders(alertSheet);ensureThresholdHeaders(threshSheet);
+
+    var thresholds=readThresholds(threshSheet),
+        lowerThresholds=readLowerThresholds(threshSheet),
+        hys=readHysteresis(threshSheet),
+        now=new Date(),
+        tz=Session.getScriptTimeZone(),
+        emails=getEscalationEmails(emailSheet),
+        telegramIds=getTelegramChatIds();
+
+    var allRecipients=[];
+    [emails.level1,emails.level2,emails.level3].forEach(function(lvl){
+      lvl.forEach(function(em){if(allRecipients.indexOf(em)===-1)allRecipients.push(em);});
+    });
+    var mcuAlertRecipients = emails.level3.slice();
+
+    var mcuOnline = isMcuCurrentlyOnline(statusSheet);
+    var prevOfflineState = getMcuOfflineState();
+
+    var MCU_OFFLINE_EMAIL_GRACE_MS = 5 * 60 * 1000;
+
+    if (!mcuOnline) {
+      if (prevOfflineState === null) {
+        var offlineNow = now;
+        var offlineTsStr = Utilities.formatDate(offlineNow, tz, "dd/MM/yyyy HH:mm:ss");
+        setMcuOfflineState("offline:" + offlineNow.getTime() + ":" + offlineTsStr);
+        Logger.log("MCU went offline at " + offlineTsStr + ". Grace period started (5 min before email).");
+        try { CacheService.getScriptCache().put("mcu_offline_email_sent", "0", 86400); } catch(e) {}
+      } else {
+        var parts0 = prevOfflineState.split(":");
+        var offlineMs0 = parseInt(parts0[1]) || now.getTime();
+        var elapsedMs0 = now.getTime() - offlineMs0;
+        var emailSentFlag = "";
+        try { emailSentFlag = CacheService.getScriptCache().get("mcu_offline_email_sent") || "0"; } catch(e) {}
+        if (elapsedMs0 >= MCU_OFFLINE_EMAIL_GRACE_MS && emailSentFlag === "0") {
+          var offlineDateObj = new Date(offlineMs0);
+          Logger.log("MCU offline for ≥5 min — sending offline notification now.");
+          sendMcuOfflineEmail(mcuAlertRecipients, telegramIds, offlineDateObj);
+          try {
+            var cacheG = CacheService.getScriptCache();
+            cacheG.put("mcu_offline_email_sent", "1", 86400);
+            cacheG.put("mcu_was_offline", "1", 86400);
+          } catch(e) {}
+        } else if (elapsedMs0 < MCU_OFFLINE_EMAIL_GRACE_MS) {
+          var secsLeft = Math.ceil((MCU_OFFLINE_EMAIL_GRACE_MS - elapsedMs0) / 1000);
+          Logger.log("MCU still offline. Email grace period: " + secsLeft + "s remaining.");
+        }
+      }
+      Logger.log("MCU is offline. Skipping temperature alert check.");
+      return;
+    } else {
+      if (prevOfflineState !== null) {
+        var parts = prevOfflineState.split(":");
+        var offlineMs = parseInt(parts[1]) || (now.getTime() - 60000);
+        setMcuOfflineState(null);
+        Logger.log("MCU came back online at " + Utilities.formatDate(now, tz, "dd/MM/yyyy HH:mm:ss"));
+        var emailWasSent = "";
+        try { emailWasSent = CacheService.getScriptCache().get("mcu_offline_email_sent") || "0"; } catch(e) {}
+        if (emailWasSent === "1") {
+          sendMcuOnlineEmail(mcuAlertRecipients, telegramIds, offlineMs, now);
+        } else {
+          Logger.log("MCU back online within grace period — no offline email was sent, skipping online notification.");
+        }
+        try {
+          var cache2 = CacheService.getScriptCache();
+          cache2.remove("mcu_was_offline");
+          cache2.remove("mcu_offline_email_sent");
+        } catch(e) {}
+        resolveAllActiveAlerts(alertSheet, Utilities.formatDate(now, tz, "dd/MM/yyyy HH:mm:ss"), now);
+      }
+    }
+
+    var lookbackTime=new Date(now.getTime()-LOOKBACK_MINUTES*60*1000),lastRow=dataSheet.getLastRow();
+    if(lastRow<2)return;
+    var rowsToCheck=Math.min(20,lastRow-1),startRow=lastRow-rowsToCheck+1;
+    var data=dataSheet.getRange(startRow,1,rowsToCheck,TOTAL_CHANNELS+1).getValues();
+
+    var previouslyActiveKeys={},prevActiveAlerts=getActiveAlerts(alertSheet);
+    prevActiveAlerts.forEach(function(a){previouslyActiveKeys["D"+a.dryer+"C"+a.chamber+"_"+a.alertType]=a;});
+
+    var latestState={};
+    for(var i=0;i<data.length;i++){
+      var row=data[i],rowTime=null;
+      if(row[0])rowTime=(row[0]instanceof Date)?row[0]:parseSheetTimestamp(row[0].toString());
+      if(!rowTime||rowTime<lookbackTime)continue;
+      for(var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++){for(var c=1;c<=NUM_CHAMBERS;c++){
+        var colIndex=(d-FIRST_DRYER)*NUM_CHAMBERS+c,temp=parseFloat(row[colIndex]);
+        if(isNaN(temp)||temp===0)continue;
+        var key="D"+d+"C"+c;
+        if(!latestState[key]||rowTime>latestState[key].rowTime)
+          latestState[key]={temp:temp,timestamp:Utilities.formatDate(rowTime,tz,"dd/MM/yyyy HH:mm:ss"),rowTime:rowTime,dryer:d,chamber:c};
+      }}
+    }
+
+    var latestTemps={};
+    for(var key in latestState){
+      var state=latestState[key],d=state.dryer,c=state.chamber,temp=state.temp,timestamp=state.timestamp,rowTime=state.rowTime;
+      latestTemps["D"+d+"C"+c]=temp;
+      var upThresh=(thresholds["D"+d]&&thresholds["D"+d]["C"+c]!==undefined)?thresholds["D"+d]["C"+c]:DEFAULT_UPPER_THRESHOLD;
+      var loThresh=(lowerThresholds["D"+d]&&lowerThresholds["D"+d]["C"+c]!==undefined)?lowerThresholds["D"+d]["C"+c]:DEFAULT_LOWER_THRESHOLD;
+      var effectiveUpperTrigger = upThresh + hys.upper;
+      var effectiveLowerTrigger = loThresh + hys.lower;
+      processThresholdAlertWithHys(alertSheet,d,c,temp,upThresh,effectiveUpperTrigger,timestamp,rowTime,now,"HIGH");
+      if(loThresh>0) processThresholdAlertWithHys(alertSheet,d,c,temp,loThresh,effectiveLowerTrigger,timestamp,rowTime,now,"LOW");
+    }
+
+    var currentlyActiveKeys={};
+    getActiveAlerts(alertSheet).forEach(function(a){currentlyActiveKeys["D"+a.dryer+"C"+a.chamber+"_"+a.alertType]=true;});
+
+    var resolvedAlerts=[];
+    Object.keys(previouslyActiveKeys).forEach(function(k){if(!currentlyActiveKeys[k])resolvedAlerts.push(previouslyActiveKeys[k]);});
+
+    var intervals=getEscalationIntervals(emailSheet),activeAlerts=getActiveAlerts(alertSheet);
+    var cache=CacheService.getScriptCache(),alertsToSend={level1:[],level2:[],level3:[]};
+
+    activeAlerts.forEach(function(alert){
+      var startTime=parseSheetTimestamp(alert.startTime);if(!startTime)return;
+      var elapsedMs=now-startTime,keyBase="esc_"+alert.dryer+"_"+alert.chamber+"_"+alert.alertType+"_";
+      var lastSent1=cache.get(keyBase+"l1"),shouldSend1=lastSent1===null||(now-parseInt(lastSent1)>=intervals.level1);
+      if(shouldSend1){alertsToSend.level1.push(alert);cache.put(keyBase+"l1",now.getTime().toString(),86400);}
+      var lastSent2=cache.get(keyBase+"l2"),shouldSend2=lastSent2===null?(elapsedMs>=intervals.level2):(now-parseInt(lastSent2)>=intervals.level2);
+      if(shouldSend2){alertsToSend.level2.push(alert);cache.put(keyBase+"l2",now.getTime().toString(),86400);}
+      var lastSent3=cache.get(keyBase+"l3"),shouldSend3=lastSent3===null?(elapsedMs>=intervals.level3):(now-parseInt(lastSent3)>=intervals.level3);
+      if(shouldSend3){alertsToSend.level3.push(alert);cache.put(keyBase+"l3",now.getTime().toString(),86400);}
+    });
+
+    if(alertsToSend.level1.length>0&&emails.level1.length>0)sendEscalationEmail(1,alertsToSend.level1,emails.level1,intervals);
+    if(alertsToSend.level2.length>0&&emails.level2.length>0)sendEscalationEmail(2,alertsToSend.level2,emails.level2,intervals);
+    if(alertsToSend.level3.length>0&&emails.level3.length>0)sendEscalationEmail(3,alertsToSend.level3,emails.level3,intervals);
+    if(alertsToSend.level1.length>0&&telegramIds.length>0){var intervalMin=Math.round(intervals.level1/60000);sendTelegramMessage(telegramIds,buildTelegramEscalationMessage(alertsToSend.level1,intervalMin));}
+    if(alertsToSend.level1.length>0){var intervalMin=Math.round(intervals.level1/60000);sendWhatsappMessage(buildWhatsappAlertMessage(alertsToSend.level1,intervalMin));}
+
+    if(resolvedAlerts.length>0){
+      resolvedAlerts.forEach(function(alert){
+        var tempKey="D"+alert.dryer+"C"+alert.chamber,currentTemp=latestTemps[tempKey]!==undefined?latestTemps[tempKey]:NaN;
+        var resolvedInfo=findResolvedAlertInfo(alertSheet,alert.dryer,alert.chamber,alert.alertType,alert.startTime);
+        var resolvedTime=resolvedInfo?resolvedInfo.endTime:formatTsForOutput(now),durSec=resolvedInfo?resolvedInfo.durationSeconds:0;
+        var alertForMsg={dryer:alert.dryer,chamber:alert.chamber,alertType:alert.alertType,startTime:alert.startTime,resolvedTime:resolvedTime,peak:alert.peak,threshold:alert.threshold};
+        var cacheKeyBase="esc_"+alert.dryer+"_"+alert.chamber+"_"+alert.alertType+"_";
+        var resolveRecipients=[];
+        if(cache.get(cacheKeyBase+"l1")!==null) emails.level1.forEach(function(e){if(resolveRecipients.indexOf(e)===-1)resolveRecipients.push(e);});
+        if(cache.get(cacheKeyBase+"l2")!==null) emails.level2.forEach(function(e){if(resolveRecipients.indexOf(e)===-1)resolveRecipients.push(e);});
+        if(cache.get(cacheKeyBase+"l3")!==null) emails.level3.forEach(function(e){if(resolveRecipients.indexOf(e)===-1)resolveRecipients.push(e);});
+        if(resolveRecipients.length>0)sendResolutionEmail(alertForMsg,currentTemp,durSec,resolveRecipients);
+        if(telegramIds.length>0&&!isNaN(currentTemp))sendTelegramMessage(telegramIds,buildTelegramResolutionMessage(alertForMsg,currentTemp,durSec));
+        else if(telegramIds.length>0)sendTelegramMessage(telegramIds,buildTelegramResolutionMessageNoTemp(alertForMsg,durSec));
+        if(!isNaN(currentTemp)) sendWhatsappMessage(buildWhatsappResolutionMessage(alertForMsg, currentTemp, durSec));
+        try{cache.remove(cacheKeyBase+"l1");cache.remove(cacheKeyBase+"l2");cache.remove(cacheKeyBase+"l3");}catch(ce){}
+        Logger.log("Resolution notification sent: Dryer "+alert.dryer+" Chamber "+alert.chamber+" ["+alert.alertType+"]");
+      });
+    }
+  }catch(err){Logger.log("ERROR in autoCheckAlerts: "+err.toString());}
+}
+
+function resolveAllActiveAlerts(alertSheet, resolvedTsStr, now) {
+  try {
+    var lastRow = alertSheet.getLastRow();
+    if (lastRow < 2) return;
+    var data = alertSheet.getRange(2, 1, lastRow - 1, 10).getValues();
+    for (var i = 0; i < data.length; i++) {
+      if (data[i][8].toString() === "ACTIVE") {
+        var startTs = parseSheetTimestamp(data[i][2].toString());
+        var dur = startTs ? Math.max(0, Math.round((now - startTs) / 1000)) : 0;
+        alertSheet.getRange(i + 2, 4).setValue(resolvedTsStr);
+        alertSheet.getRange(i + 2, 8).setValue(dur);
+        alertSheet.getRange(i + 2, 9).setValue("RESOLVED");
+        Logger.log("Auto-resolved alert for Dryer " + data[i][0] + " Chamber " + data[i][1] + " because MCU came back online.");
+      }
+    }
+  } catch(e) {
+    Logger.log("resolveAllActiveAlerts error: " + e.toString());
+  }
+}
+
+function processThresholdAlertWithHys(alertSheet, dryer, chamber, temp, threshold, effectiveTrigger, timestamp, rowTime, now, alertType) {
+  var tz = Session.getScriptTimeZone();
+  var cleanTs = Utilities.formatDate(rowTime, tz, "dd/MM/yyyy HH:mm:ss");
+  var openRow = findOpenAlertRow(alertSheet, dryer, chamber, alertType);
+  var violated = (alertType === "HIGH") ? (temp > effectiveTrigger) : (temp < effectiveTrigger);
+  var stillViolating = (alertType === "HIGH") ? (temp > threshold) : (temp < threshold);
+  if (violated) {
+    if (openRow === -1) {
+      alertSheet.appendRow([dryer, chamber, cleanTs, "Not Resolved", temp, threshold,
+        parseFloat((alertType === "HIGH" ? (temp - threshold) : (threshold - temp)).toFixed(2)),
+        0, "ACTIVE", alertType, ""]);
+    } else {
+      var rowData = alertSheet.getRange(openRow, 1, 1, 10).getValues()[0];
+      var existPeak = parseFloat(rowData[4]);
+      var startTs = parseSheetTimestamp(rowData[2].toString());
+      var durSec = startTs ? Math.max(0, Math.round((now - startTs) / 1000)) : 0;
+      var newPeak = (alertType === "HIGH") ? Math.max(temp, existPeak) : Math.min(temp, existPeak);
+      var newOver = parseFloat((alertType === "HIGH" ? (newPeak - threshold) : (threshold - newPeak)).toFixed(2));
+      alertSheet.getRange(openRow, 1, 1, 10).setValues([[rowData[0], rowData[1], rowData[2], "Not Resolved", newPeak, rowData[5], newOver, durSec, "ACTIVE", alertType]]);
+    }
+  } else if (!stillViolating) {
+    if (openRow !== -1) {
+      var rowData2 = alertSheet.getRange(openRow, 1, 1, 10).getValues()[0];
+      var startTs2 = parseSheetTimestamp(rowData2[2].toString());
+      var durSec2 = startTs2 ? Math.max(0, Math.round((rowTime - startTs2) / 1000)) : 0;
+      alertSheet.getRange(openRow, 4).setValue(cleanTs);
+      alertSheet.getRange(openRow, 8).setValue(durSec2);
+      alertSheet.getRange(openRow, 9).setValue("RESOLVED");
+    }
+  }
+}
+
+function findResolvedAlertInfo(alertSheet,dryer,chamber,alertType,startTime){var lastRow=alertSheet.getLastRow();if(lastRow<2)return null;var data=alertSheet.getRange(2,1,lastRow-1,10).getValues();for(var i=data.length-1;i>=0;i--){if(parseInt(data[i][0])===dryer&&parseInt(data[i][1])===chamber&&data[i][9].toString()===alertType&&data[i][2].toString()===startTime&&data[i][8].toString()==="RESOLVED")return{endTime:data[i][3].toString(),durationSeconds:parseInt(data[i][7])||0};}return null;}
+
+function sendResolutionEmail(alert,currentTemp,durSec,recipients){if(!recipients||recipients.length===0)return;var typeStr=alert.alertType==="LOW"?"BELOW LOWER":"ABOVE UPPER",subject="✅ RESOLVED – Dryer Temperature Alert | Dryer "+alert.dryer+" Chamber "+alert.chamber;var body="Dryer Temperature Alert RESOLVED\n============================================================\n\nThe temperature alert listed below has now been resolved.\n\n  Dryer         : "+alert.dryer+"\n  Chamber       : "+alert.chamber+"\n  Alert Type    : "+typeStr+" THRESHOLD\n  Alert Started : "+alert.startTime+"\n  Resolved At   : "+alert.resolvedTime+"\n  Duration      : "+formatDurationGas(durSec)+"\n  Peak Temp     : "+alert.peak.toFixed(2)+"°C\n  Threshold     : "+alert.threshold+"°C\n";if(!isNaN(currentTemp)){var diff=Math.abs(currentTemp-alert.threshold).toFixed(2),diffLabel=alert.alertType==="LOW"?diff+"°C above lower threshold":diff+"°C below upper threshold";body+="  Current Temp  : "+currentTemp.toFixed(2)+"°C  ("+diffLabel+")\n";}body+="\n--\nCPIL Chennai - Dryer Temperature Monitoring System (Auto-alert system. Do not reply to this mail)";try{GmailApp.sendEmail(recipients.join(","),subject,body);}catch(err){try{MailApp.sendEmail({to:recipients.join(","),subject:subject,body:body});}catch(err2){Logger.log("Failed to send resolution email: "+err2.toString());}}}
+
+function buildTelegramResolutionMessageNoTemp(alert,durSec){var lines=[];lines.push("<b>✅ Alert RESOLVED</b>\n");var typeStr=alert.alertType==="LOW"?"⬇️ Below Lower":"⬆️ Above Upper";lines.push("<b>Dryer "+alert.dryer+" – Chamber "+alert.chamber+"</b>");lines.push("  Type: "+typeStr+" Threshold");lines.push("  Alert started: "+alert.startTime);lines.push("  Resolved at:   "+alert.resolvedTime);lines.push("  Peak temp:     "+alert.peak.toFixed(2)+"°C");lines.push("  Threshold:     "+alert.threshold+"°C");lines.push("  Duration:      "+formatDurationGas(durSec||0));lines.push("");lines.push("— CPIL Chennai Dryer Temperature Monitoring System");return lines.join("\n");}
+
+function processThresholdAlert(alertSheet,dryer,chamber,temp,threshold,timestamp,rowTime,now,alertType){
+  processThresholdAlertWithHys(alertSheet,dryer,chamber,temp,threshold,threshold,timestamp,rowTime,now,alertType);
+}
+
+function getActiveAlerts(alertSheet){var lastRow=alertSheet.getLastRow();if(lastRow<2)return[];var data=alertSheet.getRange(2,1,lastRow-1,10).getValues(),active=[];data.forEach(function(row){if(row[8].toString()==="ACTIVE")active.push({dryer:parseInt(row[0]),chamber:parseInt(row[1]),startTime:row[2].toString(),peak:parseFloat(row[4]),threshold:parseFloat(row[5]),overBy:parseFloat(row[6]),alertType:row[9].toString()});});return active;}
+function getEscalationIntervals(emailSheet){var x=5,y=10,z=30;try{var xi=parseInt(emailSheet.getRange("E2").getValue()),yi=parseInt(emailSheet.getRange("F2").getValue()),zi=parseInt(emailSheet.getRange("G2").getValue());if(!isNaN(xi)&&xi>0)x=xi;if(!isNaN(yi)&&yi>0)y=yi;if(!isNaN(zi)&&zi>0)z=zi;}catch(e){}return{level1:x*60*1000,level2:y*60*1000,level3:z*60*1000};}
+function getEscalationEmails(emailSheet){var lastRow=emailSheet.getLastRow(),emails={level1:[],level2:[],level3:[]};if(lastRow<2)return emails;var data=emailSheet.getRange(2,1,lastRow-1,3).getValues();data.forEach(function(row){var e1=row[0]?row[0].toString().trim():"",e2=row[1]?row[1].toString().trim():"",e3=row[2]?row[2].toString().trim():"";if(validateEmail(e1))emails.level1.push(e1);if(validateEmail(e2))emails.level2.push(e2);if(validateEmail(e3))emails.level3.push(e3);});return emails;}
+
+function sendEscalationEmail(level,alerts,recipients,intervals){if(!recipients||recipients.length===0)return;var levelNames=["FIRST⚠️","SECOND⚠️⚠️","THIRD⚠️⚠️⚠️"],levelIcon=["⚠️WARNING!","⚠️⚠️WARNING!","⚠️⚠️⚠️WARNING!"],intervalMin=Math.round(intervals["level"+level]/60000),subject=levelIcon[level-1]+"  Dryer Temperature Alert!!  Escalation - "+levelNames[level-1]+" ("+alerts.length+" chamber(s))";var body="Dryer Temperature Threshold Alert  [Escalation "+levelNames[level-1]+"]\n================================================================\n\n"+(level===1?"This alert fires immediately and repeats every "+intervalMin+" minute(s) while the condition persists.":"This alert fires after "+intervalMin+" minute(s) and repeats every "+intervalMin+" minute(s) while the condition persists.")+"\n\n";alerts.forEach(function(a){var typeStr=a.alertType==="LOW"?"BELOW LOWER":"ABOVE UPPER";body+="  Dryer "+a.dryer+" – Chamber "+a.chamber+"  ["+typeStr+" THRESHOLD]\n    Peak Temp  : "+a.peak.toFixed(2)+"°C\n    Threshold  : "+a.threshold+"°C\n    Started At : "+a.startTime+"\n\n";});body+="--\nCPIL Chennai - Dryer Temperature Monitoring System (Auto-alert)";try{GmailApp.sendEmail(recipients.join(","),subject,body);}catch(err){try{MailApp.sendEmail({to:recipients.join(","),subject:subject,body:body});}catch(err2){Logger.log("MailApp also failed for escalation "+level+": "+err2.toString());}}}
+
+function findOpenAlertRow(alertSheet,dryer,chamber,alertType){var lastRow=alertSheet.getLastRow();if(lastRow<2)return -1;var data=alertSheet.getRange(2,1,lastRow-1,10).getValues();for(var i=data.length-1;i>=0;i--){if(parseInt(data[i][0])===dryer&&parseInt(data[i][1])===chamber&&data[i][8].toString()==="ACTIVE"&&(!alertType||data[i][9].toString()===alertType))return i+2;}return -1;}
+
+function handleAddEmail(e,emailSheet){ensureEmailHeaders(emailSheet);var email=e.parameter.email;if(!email||!validateEmail(email))return jsonResponse({error:"Invalid email"});if(getEmailList(emailSheet).indexOf(email)!==-1)return jsonResponse({error:"Email already exists"});emailSheet.appendRow([email]);return jsonResponse({success:true,message:"Email added: "+email});}
+function handleRemoveEmail(e,emailSheet){ensureEmailHeaders(emailSheet);var email=e.parameter.email;if(!email)return jsonResponse({error:"Email required"});var data=emailSheet.getDataRange().getValues();for(var i=1;i<data.length;i++){if(data[i][0].toString().trim()===email){emailSheet.deleteRow(i+1);return jsonResponse({success:true});}}return jsonResponse({error:"Email not found"});}
+function handleGetEmails(emailSheet){ensureEmailHeaders(emailSheet);return jsonResponse({emails:getEmailList(emailSheet)});}
+
+function checkDeviceStatus(){try{var ss=SpreadsheetApp.getActiveSpreadsheet(),statusSheet=getOrCreateSheet(ss,"Status Sheet");ensureStatusHeaders(statusSheet);var timeout=getStatusTimeout(statusSheet),numRows=statusSheet.getLastRow();if(numRows<2)return;var now=new Date(),data=statusSheet.getRange(2,1,numRows-1,3+NUM_CHAMBERS).getValues(),mcuOnline=false;data.forEach(function(row){var lastTs=parseSheetTimestamp(row[2].toString());if(lastTs&&(now-lastTs)/1000<=timeout)mcuOnline=true;});data.forEach(function(row,idx){var lastTs=parseSheetTimestamp(row[2].toString()),allZero=true;for(var c=0;c<NUM_CHAMBERS;c++){if(row[3+c]!==0){allZero=false;break;}}var newStatus;if(!mcuOnline)newStatus="UNKNOWN";else if(!lastTs||(now-lastTs)/1000>timeout)newStatus="OFFLINE";else newStatus=allZero?"OFFLINE":"ONLINE";statusSheet.getRange(idx+2,2).setValue(newStatus);});Logger.log("Device status check complete.");}catch(err){Logger.log("checkDeviceStatus error: "+err.toString());}}
+
+function ensureDataHeaders(sheet){if(sheet.getLastRow()>0)return;var headers=["Timestamp"];for(var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++)for(var c=1;c<=NUM_CHAMBERS;c++)headers.push("Dryer "+d+" Chamber "+c);sheet.appendRow(headers);sheet.getRange(1,1,1,headers.length).setFontWeight("bold");}
+
+function ensureThresholdHeaders(sheet){
+  if(sheet.getLastRow()>=3)return;
+  if(sheet.getLastRow()===0){var headers=["Dryer / Chamber"];for(var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++)for(var c=1;c<=NUM_CHAMBERS;c++)headers.push("Dryer "+d+" Chamber "+c);sheet.appendRow(headers);sheet.getRange(1,1,1,headers.length).setFontWeight("bold");}
+  if(sheet.getLastRow()<2){var upRow=["Upper Threshold"];for(var i=0;i<TOTAL_CHANNELS;i++)upRow.push(80);sheet.appendRow(upRow);sheet.getRange(2,1).setFontWeight("bold");}
+  if(sheet.getLastRow()<3){var loRow=["Lower Threshold"];for(var j=0;j<TOTAL_CHANNELS;j++)loRow.push(DEFAULT_LOWER_THRESHOLD);sheet.appendRow(loRow);sheet.getRange(3,1).setFontWeight("bold");}
+  if(sheet.getLastRow()<4){sheet.appendRow(["(spare)"]);}
+  if(sheet.getLastRow()<5){sheet.appendRow(["(spare)"]);}
+  if(sheet.getLastRow()<6){sheet.appendRow(["Upper Hysteresis (°C)",0]);sheet.getRange(6,1).setFontWeight("bold");}
+  if(sheet.getLastRow()<7){sheet.appendRow(["Lower Hysteresis (°C)",0]);sheet.getRange(7,1).setFontWeight("bold");}
+}
+
+function ensureStatusHeaders(sheet){if(sheet.getLastRow()>0)return;var headers=["DeviceID","Status","LastSeen"];for(var c=1;c<=NUM_CHAMBERS;c++)headers.push("C"+c);sheet.appendRow(headers);sheet.getRange(1,1,1,headers.length).setFontWeight("bold");sheet.getRange("O1").setValue("StatusTimeout(sec)");sheet.getRange("P1").setValue("edit P2");sheet.getRange("P2").setValue(DEFAULT_STATUS_TIMEOUT);sheet.getRange("Q1").setValue("MergeWindow(sec)");sheet.getRange("Q2").setValue(DEFAULT_MERGE_WINDOW);var tz=Session.getScriptTimeZone(),ts=Utilities.formatDate(new Date(),tz,"dd/MM/yyyy HH:mm:ss");for(var d = FIRST_DRYER; d < FIRST_DRYER + NUM_DRYERS; d++){var rowData=[d,"ONLINE",ts];for(var c=1;c<=NUM_CHAMBERS;c++)rowData.push(0);sheet.appendRow(rowData);}}
+function ensureEmailHeaders(sheet){if(sheet.getLastRow()===0){sheet.appendRow(["Level1 Email","Level2 Email","Level3 Email","(unused)","L1 Interval (min)","L2 Interval (min)","L3 Interval (min)"]);sheet.getRange(1,1,1,7).setFontWeight("bold");}}
+
+
+function getOrCreateSheet(ss,name){var sh=ss.getSheetByName(name);if(!sh)sh=ss.insertSheet(name);return sh;}
+function getEmailList(emailSheet){ensureEmailHeaders(emailSheet);var emails=[],lastRow=emailSheet.getLastRow();if(lastRow<2)return emails;var data=emailSheet.getRange(2,1,lastRow-1,1).getValues();data.forEach(function(r){var email=r[0].toString().trim();if(validateEmail(email))emails.push(email);});return emails;}
+function validateEmail(email){return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);}
+function parseSheetTimestamp(str){
+  if(!str)return null;
+  if(str instanceof Date)return isNaN(str.getTime())?null:str;
+  str=str.toString().trim();
+  var m;
+  m=str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
+  if(m)return new Date(parseInt(m[3]),parseInt(m[2])-1,parseInt(m[1]),parseInt(m[4]),parseInt(m[5]),parseInt(m[6]));
+  m=str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})$/);
+  if(m)return new Date(parseInt(m[3]),parseInt(m[2])-1,parseInt(m[1]),parseInt(m[4]),parseInt(m[5]),0);
+  m=str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if(m)return new Date(parseInt(m[3]),parseInt(m[2])-1,parseInt(m[1]),0,0,0);
+  m=str.match(/^(\d{1,2})-(\d{1,2})-(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
+  if(m)return new Date(parseInt(m[3]),parseInt(m[2])-1,parseInt(m[1]),parseInt(m[4]),parseInt(m[5]),parseInt(m[6]));
+  m=str.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{1,2}):(\d{2}):(\d{2})/);
+  if(m)return new Date(parseInt(m[1]),parseInt(m[2])-1,parseInt(m[3]),parseInt(m[4]),parseInt(m[5]),parseInt(m[6]));
+  m=str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if(m)return new Date(parseInt(m[1]),parseInt(m[2])-1,parseInt(m[3]),0,0,0);
+  var d=new Date(str);
+  return isNaN(d.getTime())?null:d;
+}
+function jsonResponse(obj){return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);}
+
+function handleAiChat(e,ss,dataSheet,threshSheet,statusSheet){var query=(e.parameter&&e.parameter.query)?e.parameter.query.toString():"";if(!query)return jsonResponse({error:"No query provided"});var apiKey="";try{apiKey=PropertiesService.getScriptProperties().getProperty("ANTHROPIC_API_KEY")||"";}catch(err){}if(!apiKey)return jsonResponse({error:"ANTHROPIC_API_KEY not set in Script Properties."});}
+
+function handleGetApiKeys(ss) {
+  try {
+    var sheet = ss.getSheetByName("APIs");
+    if (!sheet) return jsonResponse({ keys: [] });
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return jsonResponse({ keys: [] });
+    var data = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+    var keys = data.map(function(row) { return row[0].toString().trim(); }).filter(function(k) { return k.length > 0; });
+    return jsonResponse({ keys: keys });
+  } catch (err) {
+    return jsonResponse({ error: err.toString() });
+  }
+}
+
+// =========================================================
+// removeDuplicateRows
+// Scans the active data sheet and removes one of any pair of
+// consecutive rows whose timestamps are within
+// DUPLICATE_GAP_SECONDS of each other (default 5 s).
+// Safe to run as a time-based trigger (every 1 min).
+// =========================================================
+var DUPLICATE_GAP_SECONDS = 10;
+
+function removeDuplicateRows() {
+  try {
+    var ss     = SpreadsheetApp.getActiveSpreadsheet();
+    var sheets = ss.getSheets();
+    var totalDeleted = 0;
+
+    for (var si = 0; si < sheets.length; si++) {
+      var dataSheet = sheets[si];
+      if (PROTECTED_SHEET_NAMES.indexOf(dataSheet.getName()) !== -1) continue;
+
+      var lastRow = dataSheet.getLastRow();
+      if (lastRow < 3) continue;
+
+      var data = dataSheet.getRange(2, 1, lastRow - 1, 1).getValues();
+      var rowsToDelete = [];
+
+      for (var i = 0; i < data.length - 1; i++) {
+        var tsA = parseSheetTimestamp(data[i][0].toString());
+        var tsB = parseSheetTimestamp(data[i + 1][0].toString());
+        if (!tsA || !tsB) continue;
+
+        var diffSec = Math.abs((tsB - tsA) / 1000);
+        if (diffSec <= DUPLICATE_GAP_SECONDS) {
+          rowsToDelete.push(i + 3); // keep first row (i+2), delete second (i+3)
+          i++; // skip past the pair
+        }
+      }
+
+      if (rowsToDelete.length === 0) continue;
+
+      rowsToDelete.sort(function(a, b) { return b - a; });
+      for (var r = 0; r < rowsToDelete.length; r++) {
+        dataSheet.deleteRow(rowsToDelete[r]);
+      }
+      totalDeleted += rowsToDelete.length;
+      Logger.log('removeDuplicateRows: deleted ' + rowsToDelete.length +
+                 " row(s) from sheet '" + dataSheet.getName() + "'");
+    }
+
+    if (totalDeleted === 0) Logger.log('removeDuplicateRows: no duplicates found');
+  } catch (err) {
+    Logger.log('removeDuplicateRows error: ' + err.toString());
+  }
+}
+
+function createTriggers(){
+  ScriptApp.getProjectTriggers().forEach(function(t){ScriptApp.deleteTrigger(t);});
+  ScriptApp.newTrigger('checkDeviceStatus').timeBased().everyMinutes(1).create();
+  ScriptApp.newTrigger('autoCheckAlerts').timeBased().everyMinutes(1).create();
+  ScriptApp.newTrigger('autoGenerateAvailabilitySheets').timeBased().everyMinutes(5).create();
+
+  ScriptApp.newTrigger('autoArchivePreviousDay')
+    .timeBased()
+    .atHour(0)
+    .everyDays(1)
+    .inTimezone(Session.getScriptTimeZone())
+    .create();
+
+  Logger.log("Triggers created (midnight archive + Drive backup + auto-delete + duplicate removal). Note: Alert History snapshot tabs NO LONGER created.");
+}
+
+function testTelegramAlert(){var ids=getTelegramChatIds();if(ids.length===0){Logger.log("❌ No TELEGRAM_CHAT_IDS found.");return;}var msg="<b>✅ Dryer temperature monitor – Telegram Test</b>\n\nBot is connected and working correctly.\n\n— CPIL Chennai Dryer Temperature Monitoring System";sendTelegramMessage(ids,msg);Logger.log("✅ Test message sent.");}
+function testEmailAlert(){var ss=SpreadsheetApp.getActiveSpreadsheet(),emailSheet=getOrCreateSheet(ss,"Email IDs"),emails=getEscalationEmails(emailSheet),allRecipients=[];[emails.level1,emails.level2,emails.level3].forEach(function(lvl){lvl.forEach(function(em){if(allRecipients.indexOf(em)===-1)allRecipients.push(em);});});if(allRecipients.length===0){Logger.log("❌ No email recipients found.");return;}var subject="✅ Dryer temperature monitor – Email Test",body="CPIL Chennai Temperature Monitoring System\n\nThis is a test email.\n\n--\nCPIL Chennai Dryer Temperature Monitoring System";try{GmailApp.sendEmail(allRecipients.join(","),subject,body);Logger.log("✅ Test email sent via GmailApp.");}catch(err){try{MailApp.sendEmail({to:allRecipients.join(","),subject:subject,body:body});}catch(err2){Logger.log("❌ MailApp also failed: "+err2.toString());}}}
+
+function testWhatsappMessage() {
+  var config = getTwilioConfig();
+  if (!config) { Logger.log("❌ Twilio config missing or incomplete in APIs sheet (B2:B5)."); return; }
+  var msg = "*✅ Dryer temperature monitor – WhatsApp Test*\n\nYour Twilio WhatsApp sandbox is connected correctly.\n\n— CPIL Chennai Dryer Temperature Monitoring System";
+  sendWhatsappMessage(msg);
+  Logger.log("✅ Test WhatsApp message initiated to: " + config.to);
+}
+
+function testMcuOfflineEmail() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var emailSheet = getOrCreateSheet(ss, "Email IDs");
+  var emails = getEscalationEmails(emailSheet);
+  var mcuAlertRecipients = emails.level3.slice();
+  var telegramIds = getTelegramChatIds();
+  sendMcuOfflineEmail(mcuAlertRecipients, telegramIds, new Date());
+  Logger.log("⚆⚆ MCU offline test notification sent to Level 3 only: " + mcuAlertRecipients.join(", "));
+}
+
+function testMcuOnlineEmail() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var emailSheet = getOrCreateSheet(ss, "Email IDs");
+  var emails = getEscalationEmails(emailSheet);
+  var mcuAlertRecipients = emails.level3.slice();
+  var telegramIds = getTelegramChatIds();
+  var fakeOfflineMs = new Date().getTime() - 65 * 60 * 1000;
+  sendMcuOnlineEmail(mcuAlertRecipients, telegramIds, fakeOfflineMs, new Date());
+  Logger.log("✪✪ MCU back-online test notification sent to Level 3 only: " + mcuAlertRecipients.join(", "));
+}
+
+function testArchiveNow() {
+  Logger.log("testArchiveNow: running autoArchivePreviousDay manually...");
+  autoArchivePreviousDay();
+  Logger.log("testArchiveNow: complete.");
+}
+
+function testDeleteOldSheets() {
+  Logger.log("testDeleteOldSheets: running deleteOldArchiveSheets manually...");
+  deleteOldArchiveSheets();
+  Logger.log("testDeleteOldSheets: complete.");
+}
+
+function testDriveBackup() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheets = ss.getSheets();
+  var testSheet = null;
+  for (var i = 0; i < sheets.length; i++) {
+    if (isDateSheet(sheets[i].getName())) { testSheet = sheets[i]; break; }
+  }
+  if (!testSheet) {
+    Logger.log("testDriveBackup: No date-named archive sheet found. Run testArchiveNow first.");
+    return;
+  }
+  var nm    = testSheet.getName();
+  var parts = nm.split(' ');
+  Logger.log("testDriveBackup: Backing up date sheet: " + nm);
+  backupSheetToDrive(testSheet, nm, new Date(parseInt(parts[2]), MONTH_NAMES.indexOf(parts[1]), parseInt(parts[0])));
+  Logger.log("testDriveBackup: Done. Check your Drive folder.");
+}
+
+function testConfigBackup() {
+  Logger.log("testConfigBackup: running backupConfigSheetsToDrive manually...");
+  backupConfigSheetsToDrive();
+  Logger.log("testConfigBackup: complete. Check 'Config Snapshots' folder in your Drive backup folder.");
+}
+
+function handleGetSheetList(ss) {
+  try {
+    var MONTH_NAMES_SHORT = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    var sheets = [];
+    ss.getSheets().forEach(function(s) {
+      var nm = s.getName();
+      if (nm === 'Sheet1') {
+        sheets.push({ name: nm, label: 'Today (Live)', isToday: true, sortKey: '9999-99-99' });
+      } else if (isDateSheet(nm)) {
+        var parts = nm.split(' ');
+        var day   = parseInt(parts[0]);
+        var mon   = MONTH_NAMES_SHORT.indexOf(parts[1]) + 1;
+        var yr    = parseInt(parts[2]);
+        var sortKey = yr + '-' + String(mon).padStart(2,'0') + '-' + String(day).padStart(2,'0');
+        var startStr = String(day).padStart(2,'0') + '/' + String(mon).padStart(2,'0') + '/' + yr + ' 00:00:00';
+        var endStr   = String(day).padStart(2,'0') + '/' + String(mon).padStart(2,'0') + '/' + yr + ' 23:59:59';
+        sheets.push({ name: nm, label: nm, isToday: false, sortKey: sortKey, startStr: startStr, endStr: endStr });
+      }
+    });
+    sheets.sort(function(a, b) {
+      if (a.isToday) return -1;
+      if (b.isToday) return 1;
+      return b.sortKey > a.sortKey ? 1 : -1;
+    });
+    return jsonResponse({ sheets: sheets });
+  } catch(err) {
+    Logger.log('handleGetSheetList error: ' + err.toString());
+    return jsonResponse({ error: err.toString() });
+  }
+}
