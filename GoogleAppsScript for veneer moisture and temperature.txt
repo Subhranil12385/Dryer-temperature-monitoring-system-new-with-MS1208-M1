@@ -1,0 +1,1401 @@
+/**
+ * Google Apps Script for Veneer Moisture Monitoring
+ * with Quadratic Calibration Curve Fitting
+ *
+ * HOW IT WORKS:
+ *  1. Add calibration rows to the "Calibration" sheet (col A: Analog | col B: Moisture %)
+ *  2. Click "Moisture Monitor > 1. Update Calibration" in Google Sheets menu
+ *  3. Script fits a QUADRATIC curve: Moisture = a·ADC² + b·ADC + c
+ *     (falls back to linear if fewer than 3 calibration points)
+ *  4. Coefficients are cached in Script Properties AND written to D2:H2 of the
+ *     Calibration sheet (R², a, b, c, type) — ESP32 reads these directly via
+ *     the Sheets CSV export URL (no GAS redirect issues at boot).
+ *  5. Every ESP32 upload → doGet reads cache, computes moisture, writes to Sheet1
+ *  6. Use "2. Backfill Moisture (%)" to fill column C for all historical rows
+ *
+ * IMPORTANT — After adding/changing calibration data:
+ *  Always click "Moisture Monitor > 1. Update Calibration" to refresh D2:H2.
+ *
+ * DEPLOY STEPS (do once):
+ *  Extensions > Apps Script > paste > Ctrl+S
+ *  Deploy > New Deployment > Web App > Execute as: Me > Access: Anyone > Deploy
+ *
+ * AFTER ANY CODE CHANGE:
+ *  Deploy > Manage deployments > Edit (✏️) > Version: New version > Deploy
+ *
+ * SHEET SHARING (required for ESP32 CSV fetch):
+ *  File > Share > Share with others > "Anyone with the link" > Viewer > Done
+ */
+
+var SHEET1_NAME    = "Sheet1";
+var CAL_SHEET_NAME = "Moisture Calibration";
+var TEMP_CAL_SHEET_NAME = "Temperature Calibration";
+var SETTINGS_SHEET_NAME = "Settings";
+var DRIVE_BACKUP_FOLDER_ID = "1fJu7tlIeO7irGBPJ9o0ZM8vZ1D3cDdpO";
+
+var MONTH_NAMES = [
+  'January','February','March','April','May','June',
+  'July','August','September','October','November','December'
+];
+
+var PROTECTED_SHEET_NAMES = [
+  "Sheet1",
+  "Moisture Calibration",
+  "Settings",
+  "Temperature Calibration"
+];
+
+// ─────────────────────────────────────────────────────────────────
+//  Custom menu
+// ─────────────────────────────────────────────────────────────────
+function onOpen() {
+  ensureSettingsSheet();
+  ensureTempCalibrationSheet();
+  SpreadsheetApp.getUi()
+    .createMenu("Moisture Monitor")
+    .addItem("1. Update Moisture Calibration", "updateCalibrationFromMenu")
+    .addItem("2. Update Temp Calibration",     "updateTempCalibrationFromMenu")
+    .addItem("3. Backfill Moisture (%)",       "backfillMoisture")
+    .addSeparator()
+    .addItem("Show Current Equations",         "showEquation")
+    .addSeparator()
+    .addItem("4. Manual Daily Archive",        "autoArchivePreviousDay")
+    .addItem("5. Setup Daily Trigger",         "setupDailyTrigger")
+    .addItem("6. Setup Offline Alert Trigger", "setupOfflineTrigger")
+    .addToUi();
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Menu: Update Calibration — compute & cache, write D2:H2, show result
+// ─────────────────────────────────────────────────────────────────
+function updateCalibrationFromMenu() {
+  var result = recomputeAndCache();
+  var ui = SpreadsheetApp.getUi();
+  if (result.ok) {
+    var eqLine = result.type === "quadratic"
+      ? "Moisture = " + result.a.toExponential(4) + "·ADC²"
+        + (result.b >= 0 ? " + " : " − ") + Math.abs(result.b).toFixed(5) + "·ADC"
+        + (result.c >= 0 ? " + " : " − ") + Math.abs(result.c).toFixed(4)
+      : "Moisture = " + result.b.toFixed(5) + "·ADC"
+        + (result.c >= 0 ? " + " : " − ") + Math.abs(result.c).toFixed(4);
+    ui.alert(
+      "Calibration Updated ✓  (" + result.type + ")",
+      eqLine
+      + "\nR² = " + result.r2.toFixed(4)
+      + "\nData points used: " + result.n
+      + "\n\nCoefficients saved to Calibration sheet D2:H2\n(ESP32 will load these on next boot)",
+      ui.ButtonSet.OK
+    );
+  } else {
+    ui.alert("Calibration Failed", result.error, ui.ButtonSet.OK);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Menu: Show Current Equation
+// ─────────────────────────────────────────────────────────────────
+function showEquation() {
+  var props = PropertiesService.getScriptProperties();
+  var a  = props.getProperty("cal_a");
+  var b  = props.getProperty("cal_b");
+  var c  = props.getProperty("cal_c");
+  var n  = props.getProperty("cal_n");
+  var r2 = props.getProperty("cal_r2");
+  var tp = props.getProperty("cal_type");
+  
+  var tb = props.getProperty("temp_cal_b") || "18.75";
+  var tc = props.getProperty("temp_cal_c") || "-75.0";
+  var tr2 = props.getProperty("temp_cal_r2") || "1.0000";
+  var ttp = props.getProperty("temp_cal_type") || "Default Formula";
+  var tn = props.getProperty("temp_cal_n") || "0";
+  
+  var ui = SpreadsheetApp.getUi();
+
+  if (!b || !c) {
+    ui.alert("No moisture calibration cached.\nClick '1. Update Moisture Calibration' first.");
+    return;
+  }
+
+  var eqLine = (tp === "quadratic" && a)
+    ? "Moisture = " + Number(a).toExponential(4) + "·ADC²"
+      + (Number(b) >= 0 ? " + " : " − ") + Math.abs(Number(b)).toFixed(5) + "·ADC"
+      + (Number(c) >= 0 ? " + " : " − ") + Math.abs(Number(c)).toFixed(4)
+    : "Moisture = " + Number(b).toFixed(5) + "·ADC"
+      + (Number(c) >= 0 ? " + " : " − ") + Math.abs(Number(c)).toFixed(4);
+
+  var tempEqLine = "Temperature = " + Number(tb).toFixed(4) + "·mA"
+      + (Number(tc) >= 0 ? " + " : " − ") + Math.abs(Number(tc)).toFixed(4);
+
+  ui.alert(
+    "Current Calibration Status",
+    "=== MOISTURE (" + (tp || "linear") + ") ===\n" +
+    eqLine + "\nR² = " + Number(r2).toFixed(4) + "\nData points: " + n + "\n\n" +
+    "=== TEMPERATURE (" + ttp + ") ===\n" +
+    tempEqLine + "\nR² = " + Number(tr2).toFixed(4) + "\nData points: " + tn,
+    ui.ButtonSet.OK
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Menu: Update Temperature Calibration
+// ─────────────────────────────────────────────────────────────────
+function updateTempCalibrationFromMenu() {
+  var result = recomputeTempCalibration();
+  var ui = SpreadsheetApp.getUi();
+  if (result.ok) {
+    var eqLine = "Temperature = " + result.b.toFixed(4) + " · mA + (" + result.c.toFixed(4) + ")";
+    ui.alert(
+      "Temperature Calibration Updated ✓  (" + result.type + ")",
+      eqLine
+      + "\nR² = " + result.r2.toFixed(4)
+      + "\nData points used: " + result.n
+      + "\n\nCoefficients saved to Temp Calibration sheet H2:K2\n(ESP32 will load these on next boot)",
+      ui.ButtonSet.OK
+    );
+  } else {
+    ui.alert("Temperature Calibration Failed", result.error, ui.ButtonSet.OK);
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────
+//  Menu: Backfill column C for all existing empty rows
+// ─────────────────────────────────────────────────────────────────
+function backfillMoisture() {
+  var ui    = SpreadsheetApp.getUi();
+  var props = PropertiesService.getScriptProperties();
+  var a  = Number(props.getProperty("cal_a"));
+  var b  = Number(props.getProperty("cal_b"));
+  var c  = Number(props.getProperty("cal_c"));
+  var tp =        props.getProperty("cal_type");
+
+  if (isNaN(b) || isNaN(c)) {
+    ui.alert("No calibration cached!\nPlease click '1. Update Calibration' first.");
+    return;
+  }
+
+  var ss     = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet1 = ss.getSheetByName(SHEET1_NAME);
+  if (!sheet1) { ui.alert("Sheet1 not found!"); return; }
+
+  var lastRow = sheet1.getLastRow();
+  if (lastRow < 2) { ui.alert("No data rows in Sheet1."); return; }
+
+  var data       = sheet1.getRange(2, 1, lastRow - 1, 3).getValues();
+  var colCValues = [];
+  var count      = 0;
+
+  for (var i = 0; i < data.length; i++) {
+    var adcVal = Number(data[i][1]);
+    var colC   = data[i][2];
+    if ((colC === "" || colC === null || colC === undefined) &&
+        !isNaN(adcVal) && adcVal > 0) {
+      colCValues.push([applyEquation(adcVal, a, b, c, tp)]);
+      count++;
+    } else {
+      colCValues.push([colC]);
+    }
+  }
+
+  sheet1.getRange(2, 3, colCValues.length, 1).setValues(colCValues);
+  ui.alert("Backfill complete!\nFilled Moisture (%) for " + count + " rows.");
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Auto-update cache when Calibration sheet is edited
+// ─────────────────────────────────────────────────────────────────
+function onEdit(e) {
+  if (e && e.source) {
+    var sheet = e.source.getActiveSheet();
+    var sheetName = sheet.getName();
+    if (sheetName === CAL_SHEET_NAME) {
+      var col = e.range.getColumn();
+      var row = e.range.getRow();
+
+      // L2 is column 12, row 2.
+      // J & K are columns 10 and 11.
+      // M & N are columns 13 and 14.
+      // If any of these are edited, sync the table
+      if ((row === 2 && col === 12) || (col >= 10 && col <= 11) || (col >= 13 && col <= 14)) {
+        updateActiveTableData(sheet);
+      }
+      recomputeAndCache();
+    } else if (sheetName === TEMP_CAL_SHEET_NAME) {
+      recomputeTempCalibration();
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Sync Active Table Data (Columns A & B) from J/K or M/N based on L2
+// ─────────────────────────────────────────────────────────────────
+function updateActiveTableData(sheet) {
+  var selector = sheet.getRange("L2").getValue();
+
+  // Clear columns A & B from row 2 downwards
+  sheet.getRange("A2:B").clearContent();
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) lastRow = 2;
+
+  var data = [];
+  if (selector === "With resistor") {
+    var mValues = sheet.getRange("M2:N" + lastRow).getValues();
+    for (var i = 0; i < mValues.length; i++) {
+      if (mValues[i][0] !== "" && mValues[i][1] !== "" && mValues[i][0] !== null && mValues[i][1] !== null) {
+        data.push([mValues[i][0], mValues[i][1]]);
+      }
+    }
+  } else {
+    var jValues = sheet.getRange("J2:K" + lastRow).getValues();
+    for (var i = 0; i < jValues.length; i++) {
+      if (jValues[i][0] !== "" && jValues[i][1] !== "" && jValues[i][0] !== null && jValues[i][1] !== null) {
+        data.push([jValues[i][0], jValues[i][1]]);
+      }
+    }
+  }
+
+  if (data.length > 0) {
+    sheet.getRange(2, 1, data.length, 2).setValues(data);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  MAIN WEB APP ENTRY POINT  — called by ESP32: ?value=XXX
+// ─────────────────────────────────────────────────────────────────
+function doGet(e) {
+  // Handle custom API actions from HTML dashboard
+  if (e && e.parameter && e.parameter.action) {
+    try {
+      var action = e.parameter.action;
+      var ss     = SpreadsheetApp.getActiveSpreadsheet();
+      
+      if (action === "ping") {
+        var proximity = e.parameter.proximity;
+        var sheet1 = ss.getSheetByName(SHEET1_NAME);
+        if (sheet1) {
+          var veneerState = (proximity === "1") ? "Veneer detected" : "No veneer detected";
+          sheet1.getRange("G2").setValue(veneerState);
+          sheet1.getRange("H2").setValue("Online");
+          sheet1.getRange("I2").setValue(new Date());
+          PropertiesService.getScriptProperties().setProperty("mcu_offline_alert_sent", "false");
+        }
+        return jsonOut({ status: "success" });
+      }
+      
+      if (action === "getStatus") {
+        var sheet1 = ss.getSheetByName(SHEET1_NAME);
+        var mcuStatus = "Offline";
+        var veneerState = "NA";
+        var lastSeen = null;
+        
+        if (sheet1) {
+          mcuStatus = sheet1.getRange("H2").getValue() || "Offline";
+          veneerState = sheet1.getRange("G2").getValue() || "NA";
+          var lastSeenVal = sheet1.getRange("I2").getValue();
+          if (lastSeenVal) {
+            lastSeen = new Date(lastSeenVal);
+            var diffMs = new Date() - lastSeen;
+            if (diffMs > 20000) {
+              mcuStatus = "Offline";
+              veneerState = "NA";
+              sheet1.getRange("H2").setValue("Offline");
+              sheet1.getRange("G2").setValue("NA");
+              
+              // If offline for more than 5 minutes, run checking/sending alert
+              if (diffMs > 300000) {
+                var lastSeenStr = Utilities.formatDate(lastSeen, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+                sendOfflineAlert(lastSeenStr);
+              }
+            }
+          } else {
+            mcuStatus = "Offline";
+            veneerState = "NA";
+            sheet1.getRange("H2").setValue("Offline");
+            sheet1.getRange("G2").setValue("NA");
+          }
+        }
+        
+        var rows = [];
+        var headers = ["Timestamp", "ADC Value", "Moisture (%)", "Milliamp Value", "Temperature (C)"];
+        if (sheet1) {
+          var lastRow = sheet1.getLastRow();
+          if (lastRow > 1) {
+            var startRow = Math.max(2, lastRow - 100 + 1);
+            var numRows = lastRow - startRow + 1;
+            var dataVals = sheet1.getRange(startRow, 1, numRows, 5).getValues();
+            for (var i = 0; i < dataVals.length; i++) {
+              if (dataVals[i][0] instanceof Date) {
+                dataVals[i][0] = Utilities.formatDate(dataVals[i][0], Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+              }
+            }
+            rows = [headers].concat(dataVals);
+          } else {
+            rows = [headers];
+          }
+        }
+        
+        return jsonOut({
+          status: "success",
+          mcu_status: mcuStatus,
+          veneer_state: veneerState,
+          last_seen: lastSeen ? Utilities.formatDate(lastSeen, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss") : null,
+          rows: rows
+        });
+      }
+
+      var calSheet = ss.getSheetByName(CAL_SHEET_NAME);
+      if (!calSheet) return jsonOut({ status: "error", message: "Moisture Calibration sheet not found." });
+
+      if (action === "setResistorMode") {
+        var mode = e.parameter.mode;
+        if (mode !== "With resistor" && mode !== "Without resistor") {
+          return jsonOut({ status: "error", message: "Invalid mode. Must be 'With resistor' or 'Without resistor'." });
+        }
+        calSheet.getRange("L2").setValue(mode);
+        updateActiveTableData(calSheet);
+        var fresh = recomputeAndCache();
+        return jsonOut({
+          status: "success",
+          resistor_mode: mode,
+          cal_r2: fresh.r2,
+          cal_type: fresh.type
+        });
+      }
+
+      if (action === "getResistorMode") {
+        var mode = calSheet.getRange("L2").getValue() || "Without resistor";
+        return jsonOut({ status: "success", resistor_mode: mode });
+      }
+
+      if (action === "getCalibrationData") {
+        var mode = calSheet.getRange("L2").getValue() || "Without resistor";
+        var lastRow = calSheet.getLastRow();
+        if (lastRow < 2) lastRow = 2;
+
+        var jValues = calSheet.getRange("J2:K" + lastRow).getValues();
+        var withoutResistor = [];
+        for (var i = 0; i < jValues.length; i++) {
+          var x = jValues[i][0];
+          var y = jValues[i][1];
+          if (x !== "" && y !== "" && x !== null && y !== null && !isNaN(Number(x)) && !isNaN(Number(y))) {
+            withoutResistor.push({ adc: Number(x), moisture: Number(y) });
+          }
+        }
+
+        var mValues = calSheet.getRange("M2:N" + lastRow).getValues();
+        var withResistor = [];
+        for (var i = 0; i < mValues.length; i++) {
+          var x = mValues[i][0];
+          var y = mValues[i][1];
+          if (x !== "" && y !== "" && x !== null && y !== null && !isNaN(Number(x)) && !isNaN(Number(y))) {
+            withResistor.push({ adc: Number(x), moisture: Number(y) });
+          }
+        }
+
+        var props = PropertiesService.getScriptProperties();
+        var cal_a = Number(props.getProperty("cal_a") || 0);
+        var cal_b = Number(props.getProperty("cal_b") || 0);
+        var cal_c = Number(props.getProperty("cal_c") || 0);
+        var cal_r2 = Number(props.getProperty("cal_r2") || 0);
+        var cal_type = props.getProperty("cal_type") || "linear";
+        var cal_n = Number(props.getProperty("cal_n") || 0);
+
+        // Fetch temperature points & coefficients
+        var tempCalSheet = ss.getSheetByName(TEMP_CAL_SHEET_NAME);
+        var tempPoints = [];
+        var tempCoef = { r2: 1.0, b: 18.75, c: -75.0, type: "Default Formula" };
+        if (tempCalSheet) {
+          var tempLastRow = tempCalSheet.getLastRow();
+          if (tempLastRow >= 2) {
+            var tempRaw = tempCalSheet.getRange(2, 1, tempLastRow - 1, 2).getValues();
+            for (var i = 0; i < tempRaw.length; i++) {
+              var tx = tempRaw[i][0];
+              var ty = tempRaw[i][1];
+              if (tx !== "" && ty !== "" && tx !== null && ty !== null && !isNaN(Number(tx)) && !isNaN(Number(ty))) {
+                tempPoints.push({ ma: Number(tx), temp: Number(ty) });
+              }
+            }
+          }
+          var coefVals = tempCalSheet.getRange("H2:K2").getValues()[0];
+          if (coefVals && coefVals.length >= 4) {
+            tempCoef.r2 = Number(coefVals[0]) || 0;
+            tempCoef.b = Number(coefVals[1]) || 0;
+            tempCoef.c = Number(coefVals[2]) || 0;
+            tempCoef.type = coefVals[3] || "Default Formula";
+          }
+        }
+
+        return jsonOut({
+          status: "success",
+          resistor_mode: mode,
+          without_resistor: withoutResistor,
+          with_resistor: withResistor,
+          coef: {
+            a: cal_a,
+            b: cal_b,
+            c: cal_c,
+            r2: cal_r2,
+            type: cal_type,
+            n: cal_n
+          },
+          temp_points: tempPoints,
+          temp_coef: tempCoef
+        });
+      }
+
+      if (action === "getSettings") {
+        var settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+        if (!settingsSheet) {
+          ensureSettingsSheet();
+          settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+        }
+        var daysToKeep = settingsSheet.getRange("B1").getValue();
+        var veneerGapSec = settingsSheet.getRange("B3").getValue();
+        var alertEmail = settingsSheet.getRange("B5").getValue();
+        return jsonOut({
+          status: "success",
+          days_to_keep: Number(daysToKeep) || 10,
+          veneer_gap_sec: Number(veneerGapSec) || 5,
+          alert_email: alertEmail ? alertEmail.toString().trim() : ""
+        });
+      }
+
+      if (action === "saveSettings") {
+        var settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+        if (!settingsSheet) {
+          ensureSettingsSheet();
+          settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+        }
+        var daysToKeep = e.parameter.days_to_keep;
+        var veneerGapSec = e.parameter.veneer_gap_sec;
+        var alertEmail = e.parameter.alert_email;
+        if (daysToKeep !== undefined && daysToKeep !== "") {
+          settingsSheet.getRange("B1").setValue(Number(daysToKeep));
+        }
+        if (veneerGapSec !== undefined && veneerGapSec !== "") {
+          settingsSheet.getRange("B3").setValue(Number(veneerGapSec));
+        }
+        if (alertEmail !== undefined) {
+          settingsSheet.getRange("B5").setValue(alertEmail.toString().trim());
+        }
+        return jsonOut({
+          status: "success",
+          days_to_keep: Number(settingsSheet.getRange("B1").getValue()) || 10,
+          veneer_gap_sec: Number(settingsSheet.getRange("B3").getValue()) || 5,
+          alert_email: settingsSheet.getRange("B5").getValue() ? settingsSheet.getRange("B5").getValue().toString().trim() : ""
+        });
+      }
+
+      if (action === "saveCalibrationData") {
+        var withoutResistorData = e.parameter.without_resistor;
+        var withResistorData = e.parameter.with_resistor;
+
+        if (!withoutResistorData || !withResistorData) {
+          return jsonOut({ status: "error", message: "Missing calibration data arrays." });
+        }
+
+        var withoutArr = JSON.parse(withoutResistorData);
+        var withArr = JSON.parse(withResistorData);
+
+        if (!Array.isArray(withoutArr) || !Array.isArray(withArr)) {
+          return jsonOut({ status: "error", message: "Calibration data must be arrays." });
+        }
+
+        // Clear existing J2:K and write new values
+        calSheet.getRange("J2:K").clearContent();
+        if (withoutArr.length > 0) {
+          var jData = [];
+          for (var i = 0; i < withoutArr.length; i++) {
+            jData.push([Number(withoutArr[i].adc), Number(withoutArr[i].moisture)]);
+          }
+          calSheet.getRange(2, 10, jData.length, 2).setValues(jData);
+        }
+
+        // Clear existing M2:N and write new values
+        calSheet.getRange("M2:N").clearContent();
+        if (withArr.length > 0) {
+          var mData = [];
+          for (var i = 0; i < withArr.length; i++) {
+            mData.push([Number(withArr[i].adc), Number(withArr[i].moisture)]);
+          }
+          calSheet.getRange(2, 13, mData.length, 2).setValues(mData);
+        }
+
+        // Sync columns A & B based on current mode
+        updateActiveTableData(calSheet);
+
+        // Recompute regression & update coefficients
+        var fitResult = recomputeAndCache();
+
+        if (fitResult.ok) {
+          return jsonOut({
+            status: "success",
+            resistor_mode: fitResult.resistor_mode,
+            cal_r2: fitResult.r2,
+            cal_type: fitResult.type,
+            coef: {
+              a: fitResult.a || 0,
+              b: fitResult.b,
+              c: fitResult.c,
+              r2: fitResult.r2,
+              type: fitResult.type,
+              n: fitResult.n
+            }
+          });
+        } else {
+          return jsonOut({
+            status: "error",
+            message: "Calibration updated but curve fitting failed: " + fitResult.error
+          });
+        }
+      }
+
+      if (action === "saveTempCalibrationData") {
+        var tempCalSheet = ss.getSheetByName(TEMP_CAL_SHEET_NAME);
+        if (!tempCalSheet) {
+          ensureTempCalibrationSheet();
+          tempCalSheet = ss.getSheetByName(TEMP_CAL_SHEET_NAME);
+        }
+        var tempPointsData = e.parameter.temp_points;
+        if (!tempPointsData) {
+          return jsonOut({ status: "error", message: "Missing temp_points data." });
+        }
+        var tempArr = JSON.parse(tempPointsData);
+        if (!Array.isArray(tempArr)) {
+          return jsonOut({ status: "error", message: "temp_points must be an array." });
+        }
+
+        // Clear A2:B and write new values
+        tempCalSheet.getRange("A2:B").clearContent();
+        if (tempArr.length > 0) {
+          var tData = [];
+          for (var i = 0; i < tempArr.length; i++) {
+            tData.push([Number(tempArr[i].ma), Number(tempArr[i].temp)]);
+          }
+          tempCalSheet.getRange(2, 1, tData.length, 2).setValues(tData);
+        }
+
+        var tempResult = recomputeTempCalibration();
+
+        if (tempResult.ok) {
+          return jsonOut({
+            status: "success",
+            temp_points: tempArr,
+            temp_coef: {
+              r2: tempResult.r2,
+              b: tempResult.b,
+              c: tempResult.c,
+              type: tempResult.type
+            }
+          });
+        } else {
+          return jsonOut({
+            status: "error",
+            message: "Temperature calibration saved but regression failed: " + tempResult.error
+          });
+        }
+      }
+    } catch (err) {
+      return jsonOut({ status: "error", message: err.toString() });
+    }
+  }
+
+  // Legacy ESP32 upload
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(8000)) {
+    return jsonOut({ status: "error", message: "Server busy." });
+  }
+
+  try {
+    var ss     = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet1 = ss.getSheetByName(SHEET1_NAME);
+    if (!sheet1) return jsonOut({ status: "error", message: "Sheet1 not found." });
+
+    var rawValue = (e && e.parameter) ? e.parameter.value : undefined;
+    if (!rawValue && rawValue !== 0) {
+      return jsonOut({ status: "error", message: "Missing 'value' parameter." });
+    }
+    var adcValue = Number(rawValue);
+    if (isNaN(adcValue)) {
+      return jsonOut({ status: "error", message: "Non-numeric: " + rawValue });
+    }
+
+    var maParam   = (e && e.parameter) ? e.parameter.ma : undefined;
+    var tempParam = (e && e.parameter) ? e.parameter.temp : undefined;
+
+    var maValue   = (maParam !== undefined && maParam !== "") ? Number(maParam) : "";
+    var tempValue = (tempParam !== undefined && tempParam !== "") ? Number(tempParam) : "";
+
+    var props = PropertiesService.getScriptProperties();
+    var a  = props.getProperty("cal_a");
+    var b  = props.getProperty("cal_b");
+    var c  = props.getProperty("cal_c");
+    var tp = props.getProperty("cal_type");
+    var resistorMode = props.getProperty("resistor_mode") || "Without resistor";
+
+    if (b === null || c === null) {
+      var fresh = recomputeAndCache();
+      if (fresh.ok) {
+        a = fresh.a; b = fresh.b; c = fresh.c; tp = fresh.type;
+        resistorMode = fresh.resistor_mode || "Without resistor";
+      }
+    }
+
+    // Duplicate detection (3-second window)
+    var lastRow = sheet1.getLastRow();
+    if (lastRow > 1) {
+      var lastData = sheet1.getRange(lastRow, 1, 1, 2).getValues()[0];
+      if (Number(lastData[1]) === adcValue &&
+          lastData[0] instanceof Date &&
+          (new Date() - lastData[0]) < 3000) {
+        return jsonOut({
+          status: "duplicate_skipped",
+          cal_a: a || "0", cal_b: b || "0", cal_c: c || "0", cal_type: tp || "linear",
+          resistor_mode: resistorMode
+        });
+      }
+    }
+
+    if (sheet1.getLastRow() === 0) {
+      sheet1.appendRow(["Timestamp", "ADC Value", "Moisture (%)", "Milliamp Value", "Temperature (C)"]);
+    } else {
+      // Auto-insert column headers for mA and temperature if they don't exist
+      var headerRange = sheet1.getRange(1, 1, 1, Math.max(sheet1.getLastColumn(), 5));
+      var headers = headerRange.getValues()[0];
+      
+      // Update legacy "Raw Temp" to "Milliamp Value" if it exists, or insert if not present
+      var idxRawTemp = headers.indexOf("Raw Temp");
+      var idxMilliamp = headers.indexOf("Milliamp Value");
+      if (idxRawTemp !== -1) {
+        sheet1.getRange(1, idxRawTemp + 1).setValue("Milliamp Value");
+      } else if (idxMilliamp === -1) {
+        sheet1.getRange(1, 4).setValue("Milliamp Value");
+      }
+      
+      if (headers.indexOf("Temperature (C)") === -1) {
+        sheet1.getRange(1, 5).setValue("Temperature (C)");
+      }
+    }
+
+    var moistureLabel = (b !== null && c !== null)
+      ? applyEquation(adcValue, Number(a), Number(b), Number(c), tp)
+      : "No Calibration";
+
+    var timestamp = new Date();
+    sheet1.appendRow([timestamp, adcValue, moistureLabel, maValue, tempValue]);
+
+    // Implicit status update for telemetry upload
+    sheet1.getRange("G2").setValue("Veneer detected");
+    sheet1.getRange("H2").setValue("Online");
+    sheet1.getRange("I2").setValue(new Date());
+    PropertiesService.getScriptProperties().setProperty("mcu_offline_alert_sent", "false");
+
+    return jsonOut({
+      status   : "success",
+      timestamp: timestamp.toISOString(),
+      adc      : adcValue,
+      moisture : moistureLabel,
+      ma       : maValue,
+      temp     : tempValue,
+      cal_a    : a || "0",
+      cal_b    : b || "0",
+      cal_c    : c || "0",
+      cal_type : tp || "linear",
+      resistor_mode: resistorMode
+    });
+
+  } catch (err) {
+    return jsonOut({ status: "error", message: err.toString() });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Apply equation to an ADC value → moisture % (0–100, 1 decimal)
+// ─────────────────────────────────────────────────────────────────
+function applyEquation(adcVal, a, b, c, type) {
+  var predicted = (type === "quadratic" && !isNaN(a))
+    ? a * adcVal * adcVal + b * adcVal + c
+    : b * adcVal + c;
+  predicted = Math.max(0, Math.min(100, predicted));
+  return Math.round(predicted * 10) / 10;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Compute calibration curve, cache in Script Properties,
+//  AND write r2 / a / b / c / type to Calibration sheet D2:H2
+//  so the ESP32 can fetch them directly via CSV export URL.
+// ─────────────────────────────────────────────────────────────────
+function recomputeAndCache() {
+  try {
+    var ss       = SpreadsheetApp.getActiveSpreadsheet();
+    var calSheet = ss.getSheetByName(CAL_SHEET_NAME);
+    if (!calSheet) return { ok: false, error: "'" + CAL_SHEET_NAME + "' sheet not found." };
+
+    // Force sync of active table data from J/K or M/N before calculating fit
+    updateActiveTableData(calSheet);
+
+    var lastRow = calSheet.getLastRow();
+    if (lastRow < 2) return { ok: false, error: "No data in Calibration sheet." };
+
+    var raw    = calSheet.getRange(2, 1, lastRow - 1, 2).getValues();
+    var points = [];
+    for (var i = 0; i < raw.length; i++) {
+      var x = Number(raw[i][0]);
+      var y = Number(raw[i][1]);
+      if (!isNaN(x) && !isNaN(y) && raw[i][0] !== "" && raw[i][1] !== "") {
+        points.push([x, y]);
+      }
+    }
+
+    if (points.length < 2) {
+      return { ok: false, error: "Need ≥2 calibration points. Found: " + points.length };
+    }
+
+    var n = points.length;
+    var result;
+
+    if (n >= 3) {
+      var s0=0,s1=0,s2=0,s3=0,s4=0,t0=0,t1=0,t2=0;
+      for (var j = 0; j < n; j++) {
+        var xj=points[j][0], yj=points[j][1];
+        var x2=xj*xj, x3=x2*xj, x4=x3*xj;
+        s0+=1; s1+=xj; s2+=x2; s3+=x3; s4+=x4;
+        t0+=yj; t1+=xj*yj; t2+=x2*yj;
+      }
+      var A = [[s0,s1,s2],[s1,s2,s3],[s2,s3,s4]];
+      var B = [t0,t1,t2];
+      var coeff = gaussianElimination(A, B);
+      if (!coeff) {
+        result = linearFit(points);
+      } else {
+        var aC=coeff[2], bC=coeff[1], cC=coeff[0];
+        var r2=computeR2(points, function(x){return aC*x*x+bC*x+cC;});
+        result = { ok:true, type:"quadratic", a:aC, b:bC, c:cC, r2:r2, n:n };
+      }
+    } else {
+      result = linearFit(points);
+    }
+
+    if (!result.ok) return result;
+
+    // ── Get the resistor mode from cell L2 ────────────────────
+    var resistorMode = calSheet.getRange("L2").getValue() || "Without resistor";
+
+    // ── Cache to Script Properties ────────────────────────────
+    var props = PropertiesService.getScriptProperties();
+    props.setProperties({
+      "cal_a"   : String(result.a || 0),
+      "cal_b"   : String(result.b),
+      "cal_c"   : String(result.c),
+      "cal_n"   : String(result.n),
+      "cal_r2"  : String(result.r2),
+      "cal_type": result.type,
+      "resistor_mode": resistorMode
+    });
+
+    // ── Write a, b, c, mode to Moisture Calibration sheet E2:H2 for ESP32 CSV fetch ─
+    calSheet.getRange("E1:H1").setValues([["a", "b", "c", "resistor_mode"]]);
+    calSheet.getRange("E2:H2").setValues([[result.a || 0, result.b, result.c, resistorMode]]);
+
+    Logger.log("Cached (" + result.type + "): a=" + result.a + " b=" + result.b
+             + " c=" + result.c + " R²=" + result.r2.toFixed(4) + " Mode=" + resistorMode);
+    Logger.log("Written to Moisture Calibration!E2:H2");
+    result.resistor_mode = resistorMode;
+    return result;
+
+  } catch (err) {
+    return { ok: false, error: "Exception: " + err.toString() };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Linear least-squares fallback
+// ─────────────────────────────────────────────────────────────────
+function linearFit(points) {
+  var n=points.length, sx=0,sy=0,sxy=0,sx2=0;
+  for (var i=0;i<n;i++){
+    sx+=points[i][0]; sy+=points[i][1];
+    sxy+=points[i][0]*points[i][1]; sx2+=points[i][0]*points[i][0];
+  }
+  var denom = n*sx2 - sx*sx;
+  if (denom===0) return { ok:false, error:"All ADC values are identical." };
+  var b=(n*sxy-sx*sy)/denom, c=(sy-b*sx)/n;
+  var r2=computeR2(points, function(x){return b*x+c;});
+  return { ok:true, type:"linear", a:0, b:b, c:c, r2:r2, n:n };
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Gaussian elimination with partial pivoting
+// ─────────────────────────────────────────────────────────────────
+function gaussianElimination(A, B) {
+  var n=B.length, M=[];
+  for (var i=0;i<n;i++){ M.push(A[i].slice()); M[i].push(B[i]); }
+  for (var col=0;col<n;col++){
+    var maxRow=col;
+    for (var row=col+1;row<n;row++) if(Math.abs(M[row][col])>Math.abs(M[maxRow][col])) maxRow=row;
+    var tmp=M[col]; M[col]=M[maxRow]; M[maxRow]=tmp;
+    if (Math.abs(M[col][col])<1e-10) return null;
+    for (var r=col+1;r<n;r++){
+      var factor=M[r][col]/M[col][col];
+      for (var j=col;j<=n;j++) M[r][j]-=factor*M[col][j];
+    }
+  }
+  var x=new Array(n).fill(0);
+  for (var i=n-1;i>=0;i--){
+    x[i]=M[i][n];
+    for (var j=i+1;j<n;j++) x[i]-=M[i][j]*x[j];
+    x[i]/=M[i][i];
+  }
+  return x;
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  R² calculation
+// ─────────────────────────────────────────────────────────────────
+function computeR2(points, fitFn) {
+  var n=points.length, yMean=0;
+  for (var i=0;i<n;i++) yMean+=points[i][1];
+  yMean/=n;
+  var ssTot=0, ssRes=0;
+  for (var i=0;i<n;i++){
+    ssTot+=Math.pow(points[i][1]-yMean,2);
+    ssRes+=Math.pow(points[i][1]-fitFn(points[i][0]),2);
+  }
+  return ssTot===0 ? 1 : 1-ssRes/ssTot;
+}
+
+// ─────────────────────────────────────────────────────────────────
+function jsonOut(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Daily Archiving & Google Drive Backup System
+// ─────────────────────────────────────────────────────────────────
+
+function ensureSettingsSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+  if (!settingsSheet) {
+    settingsSheet = ss.insertSheet(SETTINGS_SHEET_NAME);
+    settingsSheet.getRange("A1").setValue("Autodelete data which are more than 10 days ago. Cannot be more than ~30 days because that will exhaust Google Sheet's Data Storage Limit");
+    settingsSheet.getRange("B1").setValue(10); // Default to keeping 10 days
+    settingsSheet.getRange("A1:B1").setFontWeight("bold");
+    settingsSheet.setColumnWidth(1, 220);
+    Logger.log("Settings sheet created.");
+  }
+  
+  // Ensure Veneer gap time (sec) is set in A3/B3
+  var valA3 = settingsSheet.getRange("A3").getValue();
+  if (valA3 === "") {
+    settingsSheet.getRange("A3").setValue("Veneer gap time (sec)");
+    settingsSheet.getRange("B3").setValue(5);
+    settingsSheet.getRange("A3:B3").setFontWeight("bold");
+  }
+
+  // Ensure Alert Email Recipient is set in A5/B5
+  var valA5 = settingsSheet.getRange("A5").getValue();
+  if (valA5 === "") {
+    settingsSheet.getRange("A5").setValue("Alert Email Recipient");
+    settingsSheet.getRange("B5").setValue("");
+    settingsSheet.getRange("A5:B5").setFontWeight("bold");
+  }
+}
+
+function getOrCreateSheet(ss, name) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+  }
+  return sheet;
+}
+
+function getDateSheetName(date) {
+  var d = date || new Date();
+  return d.getDate() + ' ' + MONTH_NAMES[d.getMonth()] + ' ' + d.getFullYear();
+}
+
+function isDateSheet(name) {
+  return /^\d{1,2}\s[A-Z][a-z]+\s\d{4}$/.test(name);
+}
+
+function isProtectedSheet(name) {
+  for (var i = 0; i < PROTECTED_SHEET_NAMES.length; i++) {
+    if (PROTECTED_SHEET_NAMES[i] === name) return true;
+  }
+  return false;
+}
+
+function parseSheetTimestamp(val) {
+  if (!val) return null;
+  if (val instanceof Date) return val;
+  var str = val.toString().trim();
+  if (str === "") return null;
+
+  // Try parsing dd/MM/yyyy HH:mm:ss
+  var parts = str.split(' ');
+  if (parts.length >= 1) {
+    var dateParts = parts[0].split('/');
+    if (dateParts.length === 3) {
+      var day = parseInt(dateParts[0], 10);
+      var month = parseInt(dateParts[1], 10) - 1;
+      var year = parseInt(dateParts[2], 10);
+      
+      var hour = 0, min = 0, sec = 0;
+      if (parts.length >= 2) {
+        var timeParts = parts[1].split(':');
+        if (timeParts.length >= 3) {
+          hour = parseInt(timeParts[0], 10);
+          min = parseInt(timeParts[1], 10);
+          sec = parseInt(timeParts[2], 10);
+        }
+      }
+      var d = new Date(year, month, day, hour, min, sec);
+      if (!isNaN(d.getTime())) return d;
+    }
+  }
+
+  // Fallback to JS Date parser
+  var dFallback = new Date(str);
+  if (!isNaN(dFallback.getTime())) return dFallback;
+  return null;
+}
+
+function getDriveBackupSubFolder(year) {
+  try {
+    var rootFolder = DriveApp.getFolderById(DRIVE_BACKUP_FOLDER_ID);
+    var yearStr = year.toString();
+    var subFolders = rootFolder.getFoldersByName(yearStr);
+    if (subFolders.hasNext()) {
+      return subFolders.next();
+    } else {
+      Logger.log("Drive: Creating year sub-folder: " + yearStr);
+      return rootFolder.createFolder(yearStr);
+    }
+  } catch(e) {
+    Logger.log("getDriveBackupSubFolder error: " + e.toString());
+    return null;
+  }
+}
+
+function arrayToCsv(data) {
+  return data.map(function(row) {
+    return row.map(function(cell) {
+      var val = (cell === null || cell === undefined) ? "" : cell.toString();
+      if (val.indexOf('"') !== -1 || val.indexOf(',') !== -1 || val.indexOf('\n') !== -1) {
+        val = '"' + val.replace(/"/g, '""') + '"';
+      }
+      return val;
+    }).join(",");
+  }).join("\n");
+}
+
+function backupSheetToDrive(archSheet, sheetName, sheetDate) {
+  try {
+    var lastRow = archSheet.getLastRow();
+    if (lastRow < 1) {
+      Logger.log("Drive backup: sheet '" + sheetName + "' is empty, skipping.");
+      return;
+    }
+
+    var numCols    = archSheet.getLastColumn();
+    var allData    = archSheet.getRange(1, 1, lastRow, numCols).getValues();
+    var csvContent = arrayToCsv(allData);
+    var month = String(sheetDate.getMonth() + 1).padStart(2, '0');
+    var day   = String(sheetDate.getDate()).padStart(2, '0');
+    var fileName = sheetDate.getFullYear() + "-" + month + "-" + day + ".csv";
+    var csvBlob    = Utilities.newBlob(csvContent, "text/csv", fileName);
+
+    var year         = sheetDate.getFullYear();
+    var targetFolder = getDriveBackupSubFolder(year);
+    if (!targetFolder) {
+      Logger.log("Drive backup: could not get/create target folder for year " + year + ". Skipping.");
+      return;
+    }
+
+    var existing = targetFolder.getFilesByName(fileName);
+    while (existing.hasNext()) {
+      existing.next().setTrashed(true);
+      Logger.log("Drive backup: trashed old file: " + fileName);
+    }
+
+    targetFolder.createFile(csvBlob);
+    Logger.log("Drive backup: uploaded '" + fileName + "' (" + lastRow + " rows) to folder '" + targetFolder.getName() + "'.");
+  } catch(e) {
+    Logger.log("Drive backup ERROR for sheet '" + sheetName + "': " + e.toString());
+  }
+}
+
+function deleteOldArchiveSheets() {
+  var ss            = SpreadsheetApp.getActiveSpreadsheet();
+  var settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+
+  if (!settingsSheet) {
+    Logger.log("Settings sheet not found. Skipping auto-delete.");
+    return;
+  }
+
+  var daysToKeep = settingsSheet.getRange("B1").getValue();
+
+  if (!daysToKeep || isNaN(daysToKeep) || daysToKeep <= 0) {
+    Logger.log("Invalid or missing value in Settings B1. Skipping auto-delete.");
+    return;
+  }
+
+  var cutoff    = new Date(new Date().getTime() - (daysToKeep * 24 * 60 * 60 * 1000));
+  var cutoffYr  = cutoff.getFullYear();
+  var cutoffMo  = cutoff.getMonth() + 1;
+  var cutoffDy  = cutoff.getDate();
+  var cutoffInt = cutoffYr * 10000 + cutoffMo * 100 + cutoffDy;
+
+  Logger.log("Auto-delete: keeping last " + daysToKeep + " days. Cutoff: " +
+             cutoffYr + "-" + cutoffMo + "-" + cutoffDy);
+
+  var allSheets    = ss.getSheets();
+  var deletedCount = 0;
+
+  for (var i = 0; i < allSheets.length; i++) {
+    var sheet     = allSheets[i];
+    var sheetName = sheet.getName();
+
+    if (isProtectedSheet(sheetName)) continue;
+    if (!isDateSheet(sheetName)) continue;
+
+    var parts    = sheetName.trim().split(' ');
+    var day      = parseInt(parts[0]);
+    var month    = MONTH_NAMES.indexOf(parts[1]) + 1;
+    var year     = parseInt(parts[2]);
+    if (isNaN(day) || month === 0 || isNaN(year)) continue;
+
+    var sheetInt = year * 10000 + month * 100 + day;
+
+    if (sheetInt < cutoffInt) {
+      Logger.log("Deleting old archive sheet: " + sheetName);
+      ss.deleteSheet(sheet);
+      deletedCount++;
+    }
+  }
+
+  Logger.log("Auto-delete done. Deleted " + deletedCount + " old archive sheet(s).");
+}
+
+function autoArchivePreviousDay() {
+  try {
+    ensureSettingsSheet();
+    var ss          = SpreadsheetApp.getActiveSpreadsheet();
+    var dataSheet   = getOrCreateSheet(ss, SHEET1_NAME);
+    var lastRow     = dataSheet.getLastRow();
+    if (lastRow < 2) {
+      Logger.log('autoArchivePreviousDay: nothing to archive.');
+      deleteOldArchiveSheets();
+      return;
+    }
+
+    var now           = new Date();
+    var todayMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+
+    var numCols = dataSheet.getLastColumn();
+    if (numCols < 1) numCols = 3;
+    var data    = dataSheet.getRange(2, 1, lastRow - 1, numCols).getValues();
+    var headers = dataSheet.getRange(1, 1, 1, numCols).getValues()[0];
+
+    var byDate     = {};
+    var rowsToKeep = [];
+
+    for (var i = 0; i < data.length; i++) {
+      var row = data[i];
+      if (!row[0]) continue;
+      var ts = parseSheetTimestamp(row[0]);
+      if (!ts) { rowsToKeep.push(row); continue; }
+
+      if (ts >= todayMidnight) {
+        rowsToKeep.push(row);
+      } else {
+        var dateKey = ts.getDate() + '_' + ts.getMonth() + '_' + ts.getFullYear();
+        if (!byDate[dateKey]) byDate[dateKey] = { date: ts, rows: [] };
+        byDate[dateKey].rows.push(row);
+      }
+    }
+
+    var archivedCount  = 0;
+    var sheetsToBackup = [];
+
+    for (var key in byDate) {
+      var group     = byDate[key];
+      var sheetName = getDateSheetName(group.date);
+      var archSheet = getOrCreateSheet(ss, sheetName);
+
+      if (archSheet.getLastRow() === 0) {
+        archSheet.appendRow(headers);
+        archSheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+        archSheet.setFrozenRows(1);
+      }
+
+      var existingLast = archSheet.getLastRow();
+      archSheet.getRange(existingLast + 1, 1, group.rows.length, numCols)
+               .setValues(group.rows);
+      archivedCount += group.rows.length;
+      Logger.log('autoArchivePreviousDay: archived ' + group.rows.length + ' rows to "' + sheetName + '"');
+
+      sheetsToBackup.push({ sheet: archSheet, name: sheetName, date: group.date });
+    }
+
+    // Read status cells to preserve them across clearContents
+    var statusG2 = dataSheet.getRange("G2").getValue();
+    var statusH2 = dataSheet.getRange("H2").getValue();
+    var statusI2 = dataSheet.getRange("I2").getValue();
+
+    dataSheet.clearContents();
+    dataSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    dataSheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+    dataSheet.setFrozenRows(1);
+    if (rowsToKeep.length > 0) {
+      dataSheet.getRange(2, 1, rowsToKeep.length, numCols)
+               .setValues(rowsToKeep);
+    }
+    
+    // Restore status cells
+    dataSheet.getRange("G2").setValue(statusG2);
+    dataSheet.getRange("H2").setValue(statusH2);
+    if (statusI2) dataSheet.getRange("I2").setValue(statusI2);
+
+    Logger.log('autoArchivePreviousDay: done. Archived ' + archivedCount +
+               ' rows. Kept ' + rowsToKeep.length + ' rows in Sheet1.');
+
+    sheetsToBackup.forEach(function(item) {
+      backupSheetToDrive(item.sheet, item.name, item.date);
+    });
+
+  } catch(err) {
+    Logger.log('autoArchivePreviousDay ERROR: ' + err.toString());
+  }
+
+  // ---- DELETE old archive sheets per Settings B1 ----
+  deleteOldArchiveSheets();
+}
+
+function setupDailyTrigger() {
+  // Delete existing triggers for autoArchivePreviousDay to avoid duplicates
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "autoArchivePreviousDay") {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  
+  // Create a new daily trigger (e.g. at 1 AM to catch all previous day data)
+  ScriptApp.newTrigger("autoArchivePreviousDay")
+    .timeBased()
+    .everyDays(1)
+    .atHour(1)
+    .create();
+    
+  SpreadsheetApp.getUi().alert("Trigger Created", "Daily backup and archive trigger created successfully to run every day at 1:00 AM.", SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Helper: Ensure Temperature Calibration sheet exists with defaults
+// ─────────────────────────────────────────────────────────────────
+function ensureTempCalibrationSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(TEMP_CAL_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(TEMP_CAL_SHEET_NAME);
+    
+    // Set up headers for columns A & B (Calib Points)
+    sheet.getRange("A1").setValue("Milliamp Value (mA)");
+    sheet.getRange("B1").setValue("Temperature (C)");
+    sheet.getRange("A1:B1").setFontWeight("bold");
+
+    // Set up headers for Columns H, I, J, K (Output coefficients)
+    sheet.getRange("H1").setValue("Calibrated R2");
+    sheet.getRange("I1").setValue("Calibrated Slope (b)");
+    sheet.getRange("J1").setValue("Calibrated Intercept (c)");
+    sheet.getRange("K1").setValue("Calib Type");
+    sheet.getRange("H1:K1").setFontWeight("bold");
+
+    // Set up the default reference table in Columns E & F
+    sheet.getRange("E1").setValue("Default mA");
+    sheet.getRange("F1").setValue("Default Temp (C)");
+    sheet.getRange("E1:F1").setFontWeight("bold");
+    
+    var defaultPoints = [
+      [4.0, 0.0],
+      [8.0, 75.0],
+      [12.0, 150.0],
+      [16.0, 225.0],
+      [20.0, 300.0]
+    ];
+    sheet.getRange(2, 5, 5, 2).setValues(defaultPoints);
+
+    // Initial default calculation to fill H2:K2
+    recomputeTempCalibration();
+    Logger.log("Temperature Calibration sheet created with defaults.");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Helper: Fit linear regression (T = b * mA + c) on calibration data
+// ─────────────────────────────────────────────────────────────────
+function recomputeTempCalibration() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName(TEMP_CAL_SHEET_NAME);
+    if (!sheet) return { ok: false, error: "Sheet not found" };
+
+    var lastRow = sheet.getLastRow();
+    var points = [];
+    if (lastRow >= 2) {
+      var raw = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+      for (var i = 0; i < raw.length; i++) {
+        var x = Number(raw[i][0]);
+        var y = Number(raw[i][1]);
+        if (!isNaN(x) && !isNaN(y) && raw[i][0] !== "" && raw[i][1] !== "") {
+          points.push([x, y]);
+        }
+      }
+    }
+
+    var n = points.length;
+    var b = 18.75;  // Default slope for 0-300C
+    var c = -75.0;  // Default intercept
+    var r2 = 1.0;
+    var type = "Default Formula";
+
+    if (n >= 2) {
+      // Linear regression: y = b*x + c
+      var sumX = 0, sumY = 0, sumXY = 0, sumXX = 0, sumYY = 0;
+      for (var j = 0; j < n; j++) {
+        var xj = points[j][0];
+        var yj = points[j][1];
+        sumX += xj;
+        sumY += yj;
+        sumXY += xj * yj;
+        sumXX += xj * xj;
+        sumYY += yj * yj;
+      }
+
+      var num = n * sumXY - sumX * sumY;
+      var den = n * sumXX - sumX * sumX;
+
+      if (Math.abs(den) > 1e-10) {
+        b = num / den;
+        c = (sumY - b * sumX) / n;
+        
+        // Compute R2
+        var meanY = sumY / n;
+        var ssTot = 0; // Total sum of squares
+        var ssRes = 0; // Residual sum of squares
+        for (var k = 0; k < n; k++) {
+          var yk = points[k][1];
+          var xk = points[k][0];
+          var yHat = b * xk + c;
+          ssTot += (yk - meanY) * (yk - meanY);
+          ssRes += (yk - yHat) * (yk - yHat);
+        }
+        
+        if (ssTot > 1e-10) {
+          r2 = 1.0 - (ssRes / ssTot);
+        } else {
+          r2 = 1.0; // All Ys are identical
+        }
+        type = "Calibrated";
+      }
+    }
+
+    // Write results to H2:K2
+    sheet.getRange("H2:K2").setValues([[r2, b, c, type]]);
+    
+    // Save to Script Properties so doGet can fetch it instantly
+    var props = PropertiesService.getScriptProperties();
+    props.setProperty("temp_cal_b", String(b));
+    props.setProperty("temp_cal_c", String(c));
+    props.setProperty("temp_cal_r2", String(r2));
+    props.setProperty("temp_cal_type", type);
+    props.setProperty("temp_cal_n", String(n));
+
+    return { ok: true, b: b, c: c, r2: r2, type: type, n: n };
+  } catch (err) {
+    Logger.log("Temp regression error: " + err.toString());
+    return { ok: false, error: err.toString() };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Microcontroller Offline Alert System
+// ─────────────────────────────────────────────────────────────────
+
+function checkMCUOfflineAlert() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet1 = ss.getSheetByName(SHEET1_NAME);
+  if (!sheet1) return;
+  
+  var lastSeenVal = sheet1.getRange("I2").getValue();
+  if (!lastSeenVal) return;
+  
+  var lastSeen = new Date(lastSeenVal);
+  var diffMs = new Date() - lastSeen;
+  if (diffMs > 300000) { // 5 minutes
+    var currentStatus = sheet1.getRange("H2").getValue();
+    var currentVeneer = sheet1.getRange("G2").getValue();
+    if (currentStatus !== "Offline" || currentVeneer !== "NA") {
+      sheet1.getRange("H2").setValue("Offline");
+      sheet1.getRange("G2").setValue("NA");
+    }
+    
+    var lastSeenStr = Utilities.formatDate(lastSeen, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+    sendOfflineAlert(lastSeenStr);
+  } else {
+    // If online, reset trigger flag
+    PropertiesService.getScriptProperties().setProperty("mcu_offline_alert_sent", "false");
+  }
+}
+
+function sendOfflineAlert(lastSeenStr) {
+  var props = PropertiesService.getScriptProperties();
+  var sent = props.getProperty("mcu_offline_alert_sent");
+  if (sent === "true") return; // already sent
+  
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var settingsSheet = ss.getSheetByName(SETTINGS_SHEET_NAME);
+  if (!settingsSheet) return;
+  
+  var email = settingsSheet.getRange("B5").getValue();
+  if (email && email.toString().trim() !== "") {
+    try {
+      MailApp.sendEmail({
+        to: email.toString().trim(),
+        subject: "[Alert] Microcontroller is OFFLINE",
+        body: "The Veneer Temperature and Moisture Monitoring System microcontroller is offline.\n\n" +
+              "It has been offline for more than 5 minutes.\n" +
+              "Last seen: " + lastSeenStr + "\n\n" +
+              "Please check the device power and network connections."
+      });
+      props.setProperty("mcu_offline_alert_sent", "true");
+    } catch (e) {
+      console.warn("Failed to send email alert: " + e.toString());
+    }
+  }
+}
+
+function setupOfflineTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "checkMCUOfflineAlert") {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  
+  ScriptApp.newTrigger("checkMCUOfflineAlert")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+    
+  SpreadsheetApp.getUi().alert("Trigger Created", "Offline alert check trigger created successfully to run every minute.", SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
